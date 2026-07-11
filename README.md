@@ -123,18 +123,18 @@ asyncio.run(main())
 
 ## Status de confirmação por componente
 
-| Componente | Status | Observação |
-|-----------|--------|------------|
-| WS2 URL (`wsm5`) | ✅ Confirmado | Frame real capturado |
-| WS2 `bar_update` | ✅ Confirmado | Payload real capturado |
-| WS3 URL (`socket.io`) | ✅ Confirmado | Handshake real capturado |
-| WS3 namespaces `/trades` `/otc` | ✅ Confirmado | Frames reais |
-| WS3 `subscribe` + account_id | ✅ Confirmado | Frame real: `["subscribe","28318"]` |
-| WS3 `tradeUpdate` (recebido) | ✅ Confirmado | Frame real capturado |
-| `direction` em maiúsculas (`CALL`/`PUT`) | ✅ Confirmado | Frame real |
-| `payout` = 0.87 (87%) | ✅ Confirmado | Frame real |
-| `status` = `"ACTIVE"` | ✅ Confirmado | Frame real |
-| Evento de ENVIO de ordem | ⚠️ Estimado | Capturar frame ↑ no DevTools |
+| Componente                               | Status        | Observação                          |
+| ---------------------------------------- | ------------- | ----------------------------------- |
+| WS2 URL (`wsm5`)                         | ✅ Confirmado | Frame real capturado                |
+| WS2 `bar_update`                         | ✅ Confirmado | Payload real capturado              |
+| WS3 URL (`socket.io`)                    | ✅ Confirmado | Handshake real capturado            |
+| WS3 namespaces `/trades` `/otc`          | ✅ Confirmado | Frames reais                        |
+| WS3 `subscribe` + account_id             | ✅ Confirmado | Frame real: `["subscribe","28318"]` |
+| WS3 `tradeUpdate` (recebido)             | ✅ Confirmado | Frame real capturado                |
+| `direction` em maiúsculas (`CALL`/`PUT`) | ✅ Confirmado | Frame real                          |
+| `payout` = 0.87 (87%)                    | ✅ Confirmado | Frame real                          |
+| `status` = `"ACTIVE"`                    | ✅ Confirmado | Frame real                          |
+| Evento de ENVIO de ordem                 | ⚠️ Estimado   | Capturar frame ↑ no DevTools        |
 
 ---
 

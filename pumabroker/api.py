@@ -1,42 +1,15 @@
 """
-api.py — Cliente REST para ordens na Puma Broker.
+api.py — Cliente REST para ordens na Puma Broker (API v1).
 
-Descoberta final via DevTools (15/06/2026 23:22):
-  As ordens NÃO são enviadas via WebSocket — são POST HTTP REST!
+Endpoint confirmado (26/06/2026):
+  POST https://trade.pumabroker.com/api/v1/trades
 
-  Endpoint confirmado:
-    POST https://trade.pumabroker.com/trades
-
-  Headers confirmados:
+  Headers:
     Authorization: Bearer <jwt_token>
     Content-Type: application/json
 
-  Payload completo real (capturado ao clicar COMPRA em AUDUSD M15):
-    {
-      "userId":     "28318",
-      "symbol":     "AUDUSD",
-      "direction":  "CALL",
-      "amount":     2,
-      "duration":   530,
-      "entryPrice": 0.70563,
-      "mode":       "CANDLE_TIME",
-      "payout":     0.85,
-      "timeframe":  "M15",
-      "verify":     "gAAAAABqMLMX8x8KnN21gQRKFTfSa2FMzxngrUyck_H5e4u_...",
-      "wallet":     "REAL"
-    }
-
 RESULTADO da ordem chega via WebSocket (WS3):
   42/trades,["tradeUpdate", {"id":"...","status":"ACTIVE",...}]
-
-Como obter o JWT token:
-  DevTools → Network → Fetch/XHR → qualquer request → Headers
-  → Authorization: Bearer <copiar este valor>
-
-Como obter o verify token:
-  DevTools → Fetch/XHR → trades → Payload
-  → campo "verify": "gAAAAABq..."
-  Nota: renovado a cada sessão de login
 """
 
 import logging
@@ -215,8 +188,21 @@ class TradesAPI:
             )
 
         if not resp.ok:
+            error_body = resp.text[:500]
+            status_msg = {
+                400: "Requisição inválida - verifique os parâmetros enviados",
+                403: "Acesso negado (verifique permissões)",
+                404: "Endpoint não encontrado",
+                409: "Conflito - ordem pode já ter sido processada",
+                422: "Dados inválidos - verifique formato",
+                429: "Muitas solicitações - tente novamente mais tarde",
+                500: "Erro interno do servidor",
+                502: "Erro de gateway - tente novamente",
+                503: "Serviço indisponível momentaneamente"
+            }.get(resp.status_code, f"Erro HTTP {resp.status_code}")
+            
             raise OrderError(
-                f"Erro {resp.status_code}: {resp.text[:200]}",
+                f"{status_msg}. Detalhes: {error_body}",
                 status_code=resp.status_code,
             )
 

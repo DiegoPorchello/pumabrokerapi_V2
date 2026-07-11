@@ -7,7 +7,7 @@ Endpoints descobertos via DevTools → Network → Socket (15/06/2026):
        → Socket.IO v4, namespace raiz
        → Eventos: price, candle, serverTime
 
-  WS2: wss://wsm5.pumabroker.com/
+  WS2: wss://wsmt5.pumabroker.com/
        → WebSocket puro (não Socket.IO)
        → Eventos: bar_update, server_time
 
@@ -27,19 +27,17 @@ from typing import Optional
 class PumaBrokerConfig:
     # ── Domínio ───────────────────────────────────────────────────────────────
     TRADE_HOST:  str = "trade.pumabroker.com"
-    MARKET_HOST: str = "wsm5.pumabroker.com"
+    MARKET_HOST: str = "wsmt5.pumabroker.com"
     BASE_URL:    str = "https://trade.pumabroker.com"
 
-    # ── REST endpoints (descobertos via XHR) ──────────────────────────────────
-    ME_URL:       str = "https://trade.pumabroker.com/me"
-    ACCOUNTS_URL: str = "https://trade.pumabroker.com/accounts"
-    BALANCE_URL:  str = "https://trade.pumabroker.com/balance"
-    SETTINGS_URL: str = "https://trade.pumabroker.com/settings"
-    ACTIVE_URL:   str = "https://trade.pumabroker.com/active"
-
-    # ── Endpoint de ordens (REST POST — confirmado 15/06/2026) ───────────────
-    # Descoberto via DevTools → Fetch/XHR → "trades" → Headers → Request URL
-    TRADES_URL:   str = "https://trade.pumabroker.com/trades"
+    # ── REST endpoints (atualizados 26/06/2026 — API v1) ─────────────────────
+    # A API foi reestruturada: agora usa /api/v1/ e /auth/
+    AUTH_LOGIN_URL: str = "https://trade.pumabroker.com/api/v1/auth/login"
+    AUTH_REFRESH_URL: str = "https://trade.pumabroker.com/api/v1/auth/refresh"
+    AUTH_LOGOUT_URL: str = "https://trade.pumabroker.com/api/v1/auth/logout"
+    ME_URL:       str = "https://trade.pumabroker.com/api/v1/users/me"
+    ACTIVE_URL:   str = "https://trade.pumabroker.com/api/v1/currencies"
+    TRADES_URL:   str = "https://trade.pumabroker.com/api/v1/trades"
 
     # ── WebSocket 1 — Socket.IO — preços tick ─────────────────────────────────
     # Frames observados: 42["price",{...}], 42["candle",{...}], 42["serverTime",{...}]
@@ -47,7 +45,7 @@ class PumaBrokerConfig:
 
     # ── WebSocket 2 — puro — candles OHLCV ───────────────────────────────────
     # Frames observados: {"type":"bar_update","symbol":"EURUSD","interval":"5",...}
-    WS_MARKET_URL: str = "wss://wsm5.pumabroker.com/"
+    WS_MARKET_URL: str = "wss://wsmt5.pumabroker.com/"
 
     # ── WebSocket 3 — Socket.IO — ordens/trades ───────────────────────────────
     # Namespaces: /trades, /otc

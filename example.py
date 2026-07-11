@@ -1,24 +1,38 @@
 """
 example.py — Exemplo funcional da biblioteca pumabroker.
 
-Como obter os tokens (DevTools):
-  session_token -> Application -> Cookies -> server_name_session
-  account_id    -> Network -> Socket -> 42/trades,["subscribe","ID"]
-  jwt_token     -> Network -> Fetch/XHR -> qualquer request -> Headers -> Authorization
-  verify_token  -> Network -> Fetch/XHR -> trades -> Payload -> campo "verify"
+IMPORTANTE: NUNCA hardcoded tokens neste arquivo.
+Use o PumaBrokerAuth para obter tokens via login:
+
+    from pumabroker.auth import PumaBrokerAuth
+    auth = PumaBrokerAuth("email@gmail.com", "senha")
+    session = auth.login()
+    # session.token → JWT (accessToken)
+    # session.user_id → "28318"
+
+Os tokens abaixo são PLACEHOLDERS — substitua pelos obtidos do login.
 """
 
 import asyncio
 import logging
 from pumabroker import PumaBroker, TradeUpdate, BarUpdateEvent
+from pumabroker.auth import PumaBrokerAuth
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 
-SESSION_TOKEN = "cd0dc3ba351b950fc7621ef63b19d855"
-ACCOUNT_ID    = "28318"
-JWT_TOKEN     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-VERIFY_TOKEN  = "gAAAAABqMLMX8x8KnN21gQRKFTfSa2FM..."
+# ⚠️ NUNCA hardcoded tokens — obter via login
+# Exemplo de como obter tokens dinamicamente:
+#   auth = PumaBrokerAuth("seu@email.com", "sua_senha")
+#   session = auth.login()
+#   SESSION_TOKEN = session.token  # ou extraia do DevTools
+#   ACCOUNT_ID = session.user_id
+#   JWT_TOKEN = session.token
+
+SESSION_TOKEN = "OBTENHA_VIA_LOGIN_OU_DEVTOOLS"
+ACCOUNT_ID    = "OBTENHA_VIA_LOGIN"
+JWT_TOKEN     = "OBTENHA_VIA_LOGIN"
+VERIFY_TOKEN  = "OBTENHA_VIA_DEVTOOLS"
 
 current_price = {}
 

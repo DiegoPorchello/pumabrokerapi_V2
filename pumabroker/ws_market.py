@@ -1,7 +1,7 @@
 """
-ws_market.py — Cliente WebSocket puro para wss://wsm5.pumabroker.com/
+ws_market.py — Cliente WebSocket puro para wss://wsmt5.pumabroker.com/
 
-Protocolo descoberto via DevTools → Socket → wsm5.pumabroker.com → Messages:
+Protocolo descoberto via DevTools → Socket → wsmt5.pumabroker.com → Messages:
 
   RECEBIDO (bar_update):
     {"type":"bar_update","symbol":"EURUSD","interval":"5",
@@ -38,7 +38,7 @@ BarHandler = Callable[[BarUpdateEvent], None]
 
 class MarketWebSocket:
     """
-    Conecta ao feed de candles OHLCV da Puma Broker (wsm5.pumabroker.com).
+    Conecta ao feed de candles OHLCV da Puma Broker (wsmt5.pumabroker.com).
 
     Uso:
         ws = MarketWebSocket(session_token="cd0dc3ba...")
@@ -92,7 +92,7 @@ class MarketWebSocket:
 
         self._ws = await websockets.connect(
             config.WS_MARKET_URL,
-            extra_headers=headers,
+            additional_headers=headers,
             # Servidor usa permessage-deflate
             compression="deflate",
             ping_interval=None,   # heartbeat manual via {"method":"server_time"}
@@ -100,6 +100,27 @@ class MarketWebSocket:
         )
         self._running = True
         logger.info("Feed de mercado conectado.")
+
+        # Envia pedido de inscrição após autenticação (WS2 puro)
+        await self._subscribe()
+
+    # ── Inscrição no feed de mercado (WS2) ──────────────────────────────────
+
+    async def _subscribe(self) -> None:
+        """
+        Envia pedido de inscrição após autenticação.
+        Frame real observado no DevTools:
+        {"method":"subscribe","params":{"symbols":["EURUSD"], "intervals":["5"]}}
+        """
+        payload = {
+            "method": "subscribe",
+            "params": {
+                "symbols": ["EURUSD"],
+                "intervals": ["5"]
+            }
+        }
+        await self._ws.send(json.dumps(payload))
+        logger.info("→ WS2 subscribe enviado: EURUSD 5min")
 
     # ── Heartbeat manual ──────────────────────────────────────────────────────
 

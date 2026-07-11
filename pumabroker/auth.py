@@ -1,49 +1,14 @@
 """
-auth.py — Autenticação automática para a Puma Broker.
+auth.py — Autenticação automática para a Puma Broker (API v1).
 
-Descoberta via DevTools (16/06/2026 00:07):
+  ENDPOINT CONFIRMADO (26/06/2026):
+    POST https://trade.pumabroker.com/api/v1/auth/login
 
-  ENDPOINT CONFIRMADO:
-    POST https://trade.pumabroker.com/login
+  Payload:  {"email": "...", "password": "..."}
+  Response: {accessToken, refreshToken, user: {id, email, name, balance, ...}}
 
-  PAYLOAD ENVIADO (real):
-    {"email": "diegoporchello@gmail.com", "password": "Semsenh@123"}
-
-  RESPONSE CONFIRMADA (real):
-    {
-      "user": {
-        "realTrades": 325,
-        "id": "28318",
-        "email": "diegoporchello@gmail.com",
-        "name": "DIEGO MARTINS",
-        "firstName": "DIEGO",
-        "lastName": "MARTINS",
-        "balance": 0,
-        "demoBalance": 9998,
-        "bonus": 18.97,
-        "isDemo": true,
-        "isVip": true,
-        "vipLevel": 1,
-        "verified": true,
-        "country": "BR",
-        "cpf": "39358547812",
-        "rollover": 5182.6,
-        "rolloverTotal": 275000,
-        "depositos": 600,
-        "winrate": 0,
-        ...
-      },
-      "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-    }
-
-  O campo "token" É o JWT Bearer usado em todas as requisições seguintes.
-  NÃO é necessário o cookie server_name_session — o JWT basta para REST.
-  O WebSocket ainda usa o cookie (set automaticamente pela sessão).
-
-SEGURANÇA:
-  - Nunca comite email/senha em código — use variáveis de ambiente
-  - O JWT expira — implemente refresh automático (chamar login() novamente)
-  - Use .env com python-dotenv
+  O accessToken é o JWT Bearer usado nas requisições seguintes.
+  O refreshToken é usado para renovar o accessToken quando expirar.
 """
 
 import logging
@@ -67,11 +32,12 @@ class AuthError(Exception):
 
 
 class UserSession:
-    """Dados da sessão do usuário após login."""
+    """Dados da sessão do usuário após login (API v1)."""
 
     def __init__(self, data: dict):
         user               = data.get("user", data)
-        self.token:        str   = data.get("token", "")
+        self.token:        str   = data.get("accessToken", data.get("token", ""))
+        self.refresh_token: str  = data.get("refreshToken", "")
         self.user_id:      str   = str(user.get("id", ""))
         self.email:        str   = user.get("email", "")
         self.name:         str   = user.get("name", "")
@@ -111,8 +77,8 @@ class PumaBrokerAuth:
         token = auth.ensure_token()
     """
 
-    # JWT dura aproximadamente 24h (estimado — sem documentação oficial)
-    TOKEN_TTL = 23 * 3600  # 23 horas para renovar com margem
+    # JWT dura aproximadamente 24h (estimado)
+    TOKEN_TTL = 23 * 3600
 
     def __init__(self, email: str, password: str):
         self._email    = email
@@ -120,6 +86,7 @@ class PumaBrokerAuth:
         self._session: Optional[UserSession] = None
         self._login_ts: float = 0.0
         self._http     = self._build_http()
+        self._session_cookie_value: Optional[str] = None
 
     def _build_http(self) -> requests.Session:
         s = requests.Session()
@@ -132,13 +99,30 @@ class PumaBrokerAuth:
         s.mount("https://", HTTPAdapter(max_retries=retry))
         return s
 
+    def _extract_session_cookie(self, resp: requests.Response) -> None:
+        """Extrai server_name_session dos headers Set-Cookie da resposta e armazena."""
+        cookies_raw = resp.headers.get("Set-Cookie", "")
+        if not cookies_raw:
+            return
+        # Pode haver múltiplos Set-Cookie headers; tratamos como string única
+        for part in cookies_raw.split(","):
+            part = part.strip()
+            if "server_name_session=" in part:
+                start = part.index("server_name_session=") + len("server_name_session=")
+                end = part.index(";", start) if ";" in part[start:] else len(part)
+                raw_val = part[start:end].strip()
+                if raw_val:
+                    self._session_cookie_value = raw_val
+                    logger.info("server_name_session capturado do Set-Cookie header")
+                    break
+
     def login(self) -> UserSession:
         """
-        Realiza login e retorna a sessão com JWT token.
+        Realiza login e retorna a sessão com JWT token (API v1).
 
-        Endpoint: POST https://trade.pumabroker.com/login
+        Endpoint: POST https://trade.pumabroker.com/api/v1/auth/login
         Payload:  {"email": "...", "password": "..."}
-        Response: {"user": {...}, "token": "eyJhbGci..."}
+        Response: {"accessToken": "eyJ...", "refreshToken": "...", "user": {...}}
 
         Raises:
             AuthError: credenciais inválidas ou servidor fora
@@ -149,7 +133,7 @@ class PumaBrokerAuth:
 
         try:
             resp = self._http.post(
-                config.LOGIN_URL,
+                config.AUTH_LOGIN_URL,
                 json=payload,
                 timeout=config.HTTP_TIMEOUT,
             )
@@ -170,7 +154,7 @@ class PumaBrokerAuth:
 
         data = resp.json()
 
-        if "token" not in data:
+        if "accessToken" not in data and "token" not in data:
             raise AuthError(f"Resposta inesperada do login: {data}")
 
         self._session  = UserSession(data)
@@ -179,19 +163,24 @@ class PumaBrokerAuth:
         # Propaga JWT para requisições futuras
         self._http.headers["Authorization"] = f"Bearer {self._session.token}"
 
+        # Tenta extrair server_name_session dos headers da resposta de login
+        self._extract_session_cookie(resp)
+
         logger.info(
-            "Login OK: %s (id=%s) balance=%.2f demo=%.2f",
+            "Login OK: %s (id=%s) balance=%.2f demo=%.2f cookie=%s",
             self._session.name,
             self._session.user_id,
             self._session.balance,
             self._session.demo_balance,
+            "SIM" if self._session_cookie_value else "NÃO",
         )
         return self._session
 
     def ensure_token(self) -> str:
         """
         Garante que o token está válido, fazendo refresh se necessário.
-        Usar antes de cada chamada REST crítica.
+
+        Usa refreshToken se disponível (API v1) ou faz login novamente.
 
         Returns:
             JWT token válido
@@ -199,13 +188,46 @@ class PumaBrokerAuth:
         if self._session is None:
             self.login()
         elif time.time() - self._login_ts >= self.TOKEN_TTL:
-            logger.info("JWT expirado — renovando automaticamente...")
-            self.login()
+            if self._session.refresh_token:
+                self._refresh_token()
+            else:
+                logger.info("JWT expirado — renovando...")
+                self.login()
         return self._session.token
+
+    def _refresh_token(self) -> None:
+        """Renova o accessToken usando o refreshToken."""
+        logger.info("Renovando JWT via refreshToken...")
+        try:
+            resp = self._http.post(
+                config.AUTH_REFRESH_URL,
+                json={"refreshToken": self._session.refresh_token},
+                timeout=config.HTTP_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                new_token = data.get("accessToken", "")
+                new_refresh = data.get("refreshToken", "")
+                if new_token:
+                    self._session.token = new_token
+                    self._http.headers["Authorization"] = f"Bearer {new_token}"
+                if new_refresh:
+                    self._session.refresh_token = new_refresh
+                self._login_ts = time.time()
+                logger.info("JWT renovado com sucesso")
+            else:
+                logger.warning("Refresh token inválido — refazendo login")
+                self.login()
+        except Exception as e:
+            logger.warning("Erro no refresh token: %s — refazendo login", e)
+            self.login()
 
     def refresh(self) -> UserSession:
         """Força renovação do token (chamar após erro 401)."""
         logger.info("Refresh forçado do JWT...")
+        if self._session and self._session.refresh_token:
+            self._refresh_token()
+            return self._session
         return self.login()
 
     @property
@@ -228,3 +250,36 @@ class PumaBrokerAuth:
     def http(self) -> requests.Session:
         """Sessão HTTP com Authorization header já configurado."""
         return self._http
+
+    @property
+    def session_cookie(self) -> Optional[str]:
+        """
+        Retorna o valor do cookie server_name_session capturado durante login.
+        Tenta na ordem:
+          1. Valor extraído do Set-Cookie header da resposta de login
+          2. Cookies da sessão requests (domínio específico e genérico)
+          3. Variável de ambiente PUMA_SESSION
+        """
+        # 1. Valor extraído diretamente dos headers de resposta
+        if self._session_cookie_value:
+            return self._session_cookie_value
+
+        # 2. Tenta extrair dos cookies da sessão requests
+        if self._http and self._http.cookies:
+            for cookie_name in ("server_name_session", "server_name_token"):
+                val = self._http.cookies.get(cookie_name, domain="pumabroker.com")
+                if val:
+                    self._session_cookie_value = val
+                    return val
+            # Tenta sem domínio específico
+            for cookie_name in ("server_name_session", "server_name_token"):
+                val = self._http.cookies.get(cookie_name)
+                if val:
+                    self._session_cookie_value = val
+                    return val
+
+        # 3. Fallback: variável de ambiente
+        env_val = os.getenv("PUMA_SESSION")
+        if env_val:
+            self._session_cookie_value = env_val
+        return env_val

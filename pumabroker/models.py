@@ -76,7 +76,7 @@ class ServerTimeWS1(BaseModel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WS2 — Candles OHLCV (wss://wsm5.pumabroker.com/)
+# WS2 — Candles OHLCV (wss://wsmt5.pumabroker.com/)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Bar(BaseModel):

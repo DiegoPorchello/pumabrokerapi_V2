@@ -1,7 +1,7 @@
 """
 bot.py — Bot de trading completo para a Puma Broker (Python).
 
-Estratégia: Cruzamento de Médias Móveis (EMA9 × EMA21)
+Estratégia: Cruzamento de Médias Móveis (EMA9 x EMA21)
   CALL quando EMA9 cruza EMA21 para cima
   PUT  quando EMA9 cruza EMA21 para baixo
 
@@ -36,7 +36,7 @@ logger = logging.getLogger("bot")
 # ── Configuração ──────────────────────────────────────────────────────────────
 @dataclass
 class BotConfig:
-    symbol:          str   = os.getenv("SYMBOL",     "AUDUSD")
+    symbol:          str   = os.getenv("SYMBOL",     "BETHUSDT")
     timeframe:       str   = os.getenv("TIMEFRAME",  "M1")
     amount:          float = float(os.getenv("AMOUNT",    "2"))
     wallet:          str   = os.getenv("WALLET",     "DEMO")    # DEMO para testar!
@@ -119,14 +119,14 @@ async def on_bar(bar: BarUpdateEvent) -> None:
         logger.debug("Max trades abertos.")
         return
     if state.profit <= -cfg.stop_loss_daily:
-        logger.warning(f"⛔ STOP DIÁRIO atingido: R${state.profit:.2f}")
+        logger.warning(f"STOP DIARIO atingido: R${state.profit:.2f}")
         state.stopped = True
         return
 
     ema9  = calc_ema(closes, cfg.ema9_period)
     ema21 = calc_ema(closes, cfg.ema21_period)
 
-    logger.info("━" * 55)
+    logger.info("=" * 55)
     logger.info(f"SINAL: {signal} | {bar.symbol} @ {bar.bar.close:.5f}")
     logger.info(f"EMA9: {ema9:.5f} | EMA21: {ema21:.5f}")
 
@@ -148,10 +148,10 @@ async def on_bar(bar: BarUpdateEvent) -> None:
                 timeframe=cfg.timeframe,
                 entry_price=bar.bar.close,
             )
-        logger.info(f"✅ Ordem enviada: {str(result)[:80]}")
+        logger.info(f"Ordem enviada: {str(result)[:80]}")
     except Exception as e:
         state.open_trades = max(0, state.open_trades - 1)
-        logger.error(f"❌ Erro na ordem: {e}")
+        logger.error(f"Erro na ordem: {e}")
 
 
 # ── Handler de resultado ──────────────────────────────────────────────────────
@@ -163,13 +163,13 @@ def on_trade_result(event: str, trade: TradeUpdate) -> None:
         profit = trade.amount * payout
         state.profit += profit
         state.wins   += 1
-        logger.info(f"🏆 WIN  | +R${profit:.2f} | Total: R${state.profit:.2f}")
+        logger.info(f"WIN  | +R${profit:.2f} | Total: R${state.profit:.2f}")
     elif trade.status == "LOSS":
         state.profit -= trade.amount
         state.losses += 1
-        logger.info(f"💀 LOSS | -R${trade.amount:.2f} | Total: R${state.profit:.2f}")
+        logger.info(f"LOSS | -R${trade.amount:.2f} | Total: R${state.profit:.2f}")
     elif trade.status == "DRAW":
-        logger.info(f"🤝 DRAW | R${trade.amount:.2f} devolvido")
+        logger.info(f"DRAW | R${trade.amount:.2f} devolvido")
 
     total = state.wins + state.losses
     wr    = (state.wins / total * 100) if total > 0 else 0
@@ -182,7 +182,7 @@ async def status_loop() -> None:
         await asyncio.sleep(60)
         total = state.wins + state.losses
         wr    = (state.wins / total * 100) if total > 0 else 0
-        status = "⛔ PARADO" if state.stopped else "✅ Rodando"
+        status = "PARADO" if state.stopped else "Rodando"
         logger.info(
             f"[STATUS] W:{state.wins} L:{state.losses} WR:{wr:.1f}% "
             f"P&L:R${state.profit:.2f} Open:{state.open_trades} {status}"
@@ -193,15 +193,15 @@ async def status_loop() -> None:
 async def main() -> None:
     global pb
 
-    print("╔══════════════════════════════════════════════════════╗")
-    print("║         PUMA BROKER BOT — EMA 9×21 (Python)         ║")
-    print("╚══════════════════════════════════════════════════════╝")
-    print(f"Símbolo:   {cfg.symbol}")
+    print("+============================================================+")
+    print("|         PUMA BROKER BOT - EMA 9x21 (Python)             |")
+    print("+============================================================+")
+    print(f"Simbolo:   {cfg.symbol}")
     print(f"Timeframe: {cfg.timeframe}")
     print(f"Valor:     R${cfg.amount}")
     print(f"Wallet:    {cfg.wallet}")
     print(f"Stop:      R${cfg.stop_loss_daily}")
-    print("──────────────────────────────────────────────────────")
+    print("----------------------------------------------------------")
 
     email    = os.getenv("PUMA_EMAIL",    "")
     password = os.getenv("PUMA_PASSWORD", "")
@@ -236,4 +236,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot encerrado pelo usuário.")
+        logger.info("Bot encerrado pelo usuario.")

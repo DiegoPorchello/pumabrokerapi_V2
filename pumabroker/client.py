@@ -4,7 +4,7 @@ client.py — Interface unificada para a Puma Broker.
 Fluxo completo confirmado via DevTools (15-16/06/2026):
 
   1. POST /login → JWT token + user_id automático
-  2. WSS wsm5.pumabroker.com → candles OHLCV em tempo real
+  2. WSS wsmt5.pumabroker.com → candles OHLCV em tempo real
   3. WSS socket.io/trades → resultado de ordens (tradeUpdate)
   4. POST /trades → abertura de ordem com JWT no header
 
@@ -189,13 +189,33 @@ class PumaBroker:
         return r.json()
 
     def get_active_assets(self) -> dict:
-        """GET /active — ativos disponíveis para negociação."""
+        """GET /currencies — ativos disponíveis para negociação."""
         http = self._auth.http if self._auth else None
         if not http:
             raise RuntimeError("Sem sessão HTTP.")
         r = http.get(config.ACTIVE_URL, timeout=config.HTTP_TIMEOUT)
         r.raise_for_status()
         return r.json()
+
+    def is_asset_available(self, symbol: str) -> bool:
+        """
+        Verifica se o ativo está disponível/aberto para negociação.
+        Consulta a API de ativos ativos e checa se o símbolo está na lista.
+        """
+        try:
+            assets = self.get_active_assets()
+            # A API retorna lista ou dict; normaliza para busca case-insensitive
+            if isinstance(assets, dict):
+                # procura em chaves e valores
+                symbol_upper = symbol.upper()
+                return any(symbol_upper in str(k).upper() or symbol_upper in str(v).upper()
+                           for k, v in assets.items())
+            elif isinstance(assets, list):
+                return any(symbol.upper() in str(item).upper() for item in assets)
+            return False
+        except Exception as e:
+            logger.error(f"Erro CRÍTICO ao verificar disponibilidade de {symbol}: {e}")
+            raise RuntimeError(f"Não foi possível verificar disponibilidade do ativo {symbol}: {e}") from e
 
     # ── Candles em tempo real ─────────────────────────────────────────────────
 
@@ -259,6 +279,13 @@ class PumaBroker:
             entry_price: Preço atual (use bar.bar.close do on_bar)
             payout:      Retorno esperado (0.85 = 85%)
         """
+        # Valida se o ativo está disponível para negociação
+        if not self.is_asset_available(symbol):
+            raise RuntimeError(
+                f"Ativo {symbol} não está disponível/aberto para negociação. "
+                f"Verifique os ativos ativos via get_active_assets()."
+            )
+
         self._ensure_jwt()
         return self._trades_api.buy_call(
             symbol=symbol, amount=amount, timeframe=timeframe,
@@ -276,6 +303,13 @@ class PumaBroker:
         """
         Abre posição PUT (queda) via POST REST.
         """
+        # Valida se o ativo está disponível para negociação
+        if not self.is_asset_available(symbol):
+            raise RuntimeError(
+                f"Ativo {symbol} não está disponível/aberto para negociação. "
+                f"Verifique os ativos ativos via get_active_assets()."
+            )
+
         self._ensure_jwt()
         return self._trades_api.buy_put(
             symbol=symbol, amount=amount, timeframe=timeframe,
