@@ -14,7 +14,7 @@ Endpoints:
   GET  /active     → Ativos disponíveis
   POST /trades     → Abrir ordem
   GET  /trades/<id> → Status de uma ordem
-  GET  /ws2-session → Cookie server_name_session para WS2
+  GET  /ws2-session → JWT accessToken (server_name_session) para WS2
   GET  /health     → Health check
 """
 
@@ -25,6 +25,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -55,6 +56,8 @@ class PumaDaemon:
     # Circuit breaker para re-login automático do WS2
     MAX_RELOGIN_ATTEMPTS = 3
     _relogin_failures: int = 0
+    _relogin_lock = threading.Lock()
+    _relogging_in: bool = False
 
     @classmethod
     def push_log(cls, entry: dict):
@@ -73,13 +76,15 @@ class PumaDaemon:
         self._auth: PumaBrokerAuth | None = None
         self._trades_api: TradesAPI | None = None
         self._user_id: str | None = None
-        self._copy_enabled = True
+        self._copy_enabled = False
+        self._copy_user_confirmed = False  # só permite copy se usuário confirmar via toggle explícito
         self._copy_sessions: list[dict] = []
+        self._recent_orders: deque[dict] = deque(maxlen=50)
         self._load_sessions()
 
     def _save_sessions(self):
         data = {
-            "enabled": self._copy_enabled,
+            "enabled": False,  # NUNCA salva True — só toggle via UI reativa em runtime
             "accounts": [
                 {
                     "id": acc["id"],
@@ -107,45 +112,72 @@ class PumaDaemon:
             logger.warning("Falha ao salvar sessões copy: %s", e)
 
     def _load_sessions(self):
+        """Carrega sessoes de copy trading do arquivo JSON.
+        NAO faz login automatico -- login e feito sob demanda (lazy) quando copy esta ativo.
+        """
         try:
-            with open(self.COPY_SESSIONS_FILE) as f:
+            with open(self.COPY_SESSIONS_FILE, "r") as f:
                 data = json.load(f)
-            self._copy_enabled = data.get("enabled", True)
+            # NUNCA carrega "enabled" do arquivo — só toggle explícito via UI reinicia copy
+            self._copy_enabled = False
             for acc_data in data.get("accounts", []):
-                try:
-                    acc = self._copy_account_login(
-                        acc_data["label"],
-                        acc_data["email"],
-                        acc_data["password"],
-                        acc_data.get("is_demo", True),
-                    )
-                    acc["id"] = acc_data["id"]
-                    acc["active"] = acc_data.get("active", True)
-                    acc["last_error"] = acc_data.get("last_error")
-                    acc["initial_balance"] = acc_data.get("initial_balance", acc["initial_balance"])
-                    acc["total_trades"] = acc_data.get("total_trades", 0)
-                    acc["total_wins"] = acc_data.get("total_wins", 0)
-                    acc["total_losses"] = acc_data.get("total_losses", 0)
-                    acc["total_profit"] = acc_data.get("total_profit", 0.0)
-                    if acc_data.get("started_at"):
-                        try:
-                            acc["started_at"] = datetime.fromisoformat(acc_data["started_at"])
-                        except ValueError:
-                            pass
-                    if acc_data.get("last_sync_at"):
-                        try:
-                            acc["last_sync_at"] = datetime.fromisoformat(acc_data["last_sync_at"])
-                        except ValueError:
-                            acc["last_sync_at"] = None
-                    self._copy_sessions.append(acc)
-                except Exception as e:
-                    logger.warning("Falha ao restaurar conta copy %s: %s", acc_data.get("label", "?"), e)
+                # Reconstrói a conta SEM fazer login -- só guarda configuração
+                acc = {
+                    "id": acc_data["id"],
+                    "label": acc_data["label"],
+                    "email": acc_data["email"],
+                    "_password": acc_data.get("password", ""),
+                    "is_demo": acc_data["is_demo"],
+                    "active": acc_data.get("active", True),
+                    "api": None,
+                    "auth": None,
+                    "last_error": acc_data.get("last_error"),
+                    "last_sync_at": datetime.fromisoformat(acc_data["last_sync_at"]) if acc_data.get("last_sync_at") else None,
+                    "initial_balance": acc_data.get("initial_balance", 0),
+                    "total_trades": acc_data.get("total_trades", 0),
+                    "total_wins": acc_data.get("total_wins", 0),
+                    "total_losses": acc_data.get("total_losses", 0),
+                    "total_profit": acc_data.get("total_profit", 0.0),
+                    "started_at": datetime.fromisoformat(acc_data["started_at"]) if acc_data.get("started_at") else datetime.now(),
+                }
+                self._copy_sessions.append(acc)
         except FileNotFoundError:
             pass
         except Exception as e:
-            logger.warning("Falha ao carregar sessões copy: %s", e)
+            logger.warning("Falha ao carregar sessoes copy: %s", e)
 
-    def _copy_fetch_balance(self, auth: PumaBrokerAuth, is_demo: bool) -> float:
+    def _copy_account_lazy_login(self, acc: dict) -> bool:
+        """Garante que a conta copy esta logada (lazy login).
+        Respeita _copy_enabled — NUNCA loga se copy trading estiver desligado.
+        Retorna True se logado com sucesso, False caso contrario.
+        """
+        if not self._copy_enabled:
+            return False
+        if acc.get("api") and acc.get("auth"):
+            return True
+        try:
+            auth = PumaBrokerAuth(acc["email"], acc["_password"])
+            session = auth.login()
+            api = TradesAPI(
+                jwt_token=session.token,
+                user_id=session.user_id,
+                wallet="DEMO" if acc["is_demo"] else "REAL",
+            )
+            initial_balance = self._copy_fetch_balance(auth, acc["is_demo"])
+            acc["auth"] = auth
+            acc["api"] = api
+            acc["initial_balance"] = initial_balance
+            acc["started_at"] = datetime.now()
+            logger.info("Copy account login (lazy): %s (%s)", acc["label"], acc["email"])
+            return True
+        except Exception as e:
+            acc["last_error"] = str(e)[:200]
+            logger.warning("Copy account login failed (lazy): %s -- %s", acc["label"], e)
+            return False
+
+    def _copy_fetch_balance(self, auth: PumaBrokerAuth | None, is_demo: bool) -> float:
+        if auth is None:
+            return 0.0
         try:
             auth.ensure_token()
             url = f"{config.BASE_URL}/api/v1/users/{auth.user_id}"
@@ -159,36 +191,26 @@ class PumaDaemon:
         except Exception:
             return 0.0
 
-    def _copy_account_login(self, label: str, email: str, password: str, is_demo: bool) -> dict:
-        auth = PumaBrokerAuth(email, password)
-        session = auth.login()
-        api = TradesAPI(
-            jwt_token=session.token,
-            user_id=session.user_id,
-            wallet="DEMO" if is_demo else "REAL",
-        )
-        initial_balance = self._copy_fetch_balance(auth, is_demo)
-        return {
+    def copy_add_account(self, label: str, email: str, password: str, is_demo: bool) -> dict:
+        # Cria a conta SEM fazer login imediato -- login sera lazy quando copy ativado
+        acc = {
             "id": f"copy_{int(time.time() * 1000)}_{len(self._copy_sessions)}",
             "label": label,
             "email": email,
             "is_demo": is_demo,
             "_password": password,
             "active": True,
-            "api": api,
-            "auth": auth,
+            "api": None,
+            "auth": None,
             "last_error": None,
             "last_sync_at": None,
-            "initial_balance": initial_balance,
+            "initial_balance": 0,
             "total_trades": 0,
             "total_wins": 0,
             "total_losses": 0,
             "total_profit": 0.0,
             "started_at": datetime.now(),
         }
-
-    def copy_add_account(self, label: str, email: str, password: str, is_demo: bool) -> dict:
-        acc = self._copy_account_login(label, email, password, is_demo)
         self._copy_sessions.append(acc)
         self._save_sessions()
         logger.info("Copy account added: %s (%s)", label, email)
@@ -213,30 +235,16 @@ class PumaDaemon:
                 if "is_demo" in body:
                     new_is_demo = bool(body["is_demo"])
                     if new_is_demo != acc["is_demo"]:
-                        try:
-                            new_acc = self._copy_account_login(
-                                acc["label"],
-                                acc["email"],
-                                acc["_password"],
-                                new_is_demo,
-                            )
-                            new_acc["id"] = acc["id"]
-                            new_acc["active"] = acc["active"]
-                            idx = self._copy_sessions.index(acc)
-                            self._copy_sessions[idx] = new_acc
-                            logger.info(
-                                "Copy account %s tipo alterado: %s -> %s",
-                                acc["label"],
-                                "DEMO" if acc["is_demo"] else "REAL",
-                                "DEMO" if new_is_demo else "REAL",
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "Falha ao alterar tipo da conta %s: %s",
-                                acc["label"],
-                                e,
-                            )
-                            return False
+                        # Atualiza is_demo — reset do auth/api para forçar novo login lazy na próxima sync
+                        acc["is_demo"] = new_is_demo
+                        acc["auth"] = None
+                        acc["api"] = None
+                        logger.info(
+                            "Copy account %s tipo alterado: %s -> %s (login lazy no próximo sync)",
+                            acc["label"],
+                            "DEMO" if not new_is_demo else "REAL",
+                            "DEMO" if new_is_demo else "REAL",
+                        )
                 self._save_sessions()
                 logger.info("Copy account %s updated", acc["label"])
                 return True
@@ -252,7 +260,7 @@ class PumaDaemon:
         return False
 
     def _copy_account_to_dict(self, acc: dict) -> dict:
-        current_balance = self._copy_fetch_balance(acc["auth"], acc["is_demo"])
+        current_balance = self._copy_fetch_balance(acc.get("auth"), acc["is_demo"])
         return {
             "id": acc["id"],
             "label": acc["label"],
@@ -281,8 +289,9 @@ class PumaDaemon:
 
     def copy_toggle_enabled(self) -> bool:
         self._copy_enabled = not self._copy_enabled
+        self._copy_user_confirmed = self._copy_enabled  # usuário confirmou explicitamente via toggle
         self._save_sessions()
-        logger.info("Copy trading toggled to %s", self._copy_enabled)
+        logger.info("Copy trading toggled to %s (user_confirmed=%s)", self._copy_enabled, self._copy_user_confirmed)
         return self._copy_enabled
 
     def login(self, email: str, password: str) -> dict:
@@ -300,18 +309,18 @@ class PumaDaemon:
             wallet="DEMO" if session.is_demo else "REAL",
         )
 
-        # Extrai o cookie de sessão WS2 (server_name_session)
-        ws2_session = self._auth.session_cookie
+        # Extrai o accessToken JWT como token WS2
+        ws2_token = self._auth.ws2_token
 
-        if ws2_session:
-            ws2_preview = ws2_session[:20] + "..." if len(ws2_session) > 20 else ws2_session
+        if ws2_token:
+            ws2_preview = ws2_token[:20] + "..." if len(ws2_token) > 20 else ws2_token
         else:
             ws2_preview = "N/D"
 
         logger.info(
-            "Login OK: %s (id=%s) ws2_session=%s preview=%s",
+            "Login OK: %s (id=%s) ws2_token=%s preview=%s",
             session.name, session.user_id,
-            "SIM" if ws2_session else "NÃO",
+            "SIM" if ws2_token else "NÃO",
             ws2_preview,
         )
 
@@ -331,7 +340,7 @@ class PumaDaemon:
                 "country": session.country,
             },
             "token": session.token,
-            "ws2Session": ws2_session,
+            "ws2Session": ws2_token,
         }
 
     def _ensure_auth(self):
@@ -381,6 +390,25 @@ class PumaDaemon:
         payout = body.get("payout", 0.85)
         timeframe = body.get("timeframe") or self._expiration_to_timeframe(body.get("expiration", 60))
 
+        # ── DETECÇÃO DE DUPLICATAS ──
+        now = time.time()
+        dupe_key = (body["asset"], body["direction"], body["amount"])
+        for prev in self._recent_orders:
+            if (prev["key"] == dupe_key and
+                now - prev["time"] < 30 and
+                prev.get("entryPrice") == body.get("entryPrice")):
+                logger.warning(
+                    "═══ DUPLICATA DETECTADA ═══ asset=%s dir=%s amount=%s intervalo=%.1fs "
+                    "(mesmo ativo + direção + valor + entryPrice em <30s)",
+                    body["asset"], body["direction"], body["amount"], now - prev["time"]
+                )
+                break
+        self._recent_orders.append({
+            "key": dupe_key,
+            "entryPrice": body.get("entryPrice"),
+            "time": now,
+        })
+
         _t0 = time.perf_counter()
         _t_start_send = None
 
@@ -420,11 +448,27 @@ class PumaDaemon:
             logger.info(f"[LATENCY] place_trade RETRY: puma_api={round((_t2 - _t_retry) * 1000)}ms total={round((_t2 - _t0) * 1000)}ms")
 
         # ── COPY TRADER: dispara em threads separadas (não bloqueia a trade principal) ──
-        if self._copy_enabled:
+        # PROTECAO: só executa se usuario confirmou explicitamente via toggle + flag ativa
+        # A flag _copy_user_confirmed NUNCA persiste no arquivo, entao mesmo que o arquivo
+        # .copy_sessions.json tenha "enabled": true, a copia nao roda apos restart.
+        if self._copy_enabled and not self._copy_user_confirmed:
+            logger.warning(
+                "COPY TRADE BLOQUEADO: _copy_enabled=True mas _copy_user_confirmed=False. "
+                "Usuario precisa ativar copy via toggle explicito na interface."
+            )
+        if self._copy_enabled and self._copy_user_confirmed:
             n_copies = 0
             for acc in self._copy_sessions:
-                if not acc["active"] or not acc.get("api"):
+                if not acc["active"]:
                     continue
+                # Lazy login: se a conta não tem auth/api, cria agora
+                if acc.get("auth") is None or acc.get("api") is None:
+                    try:
+                        self._copy_account_lazy_login(acc)
+                    except Exception as e:
+                        acc["last_error"] = str(e)[:200]
+                        logger.warning("Copy trade lazy login FAIL: %s — %s", acc["label"], str(e)[:200])
+                        continue
                 n_copies += 1
                 t = threading.Thread(
                     target=self._executar_copy_em_thread,
@@ -462,19 +506,41 @@ class PumaDaemon:
     def get_trade(self, order_id: str) -> dict:
         self._ensure_auth()
         self._ensure_token()
+
+        target_url = f"{config.TRADES_URL}/{order_id}"
+
         r = self._auth.http.get(
-            f"{config.TRADES_URL}/{order_id}",
+            target_url,
             timeout=config.HTTP_TIMEOUT,
         )
         if r.status_code == 401:
             logger.warning("JWT expirado em get_trade — renovando e retentando...")
             self._auth.login()
             r = self._auth.http.get(
-                f"{config.TRADES_URL}/{order_id}",
+                target_url,
                 timeout=config.HTTP_TIMEOUT,
             )
-        r.raise_for_status()
-        return r.json()
+
+        if not r.ok:
+            raise OrderError(
+                f"Erro ao buscar trade {order_id}: HTTP {r.status_code} — {r.text[:500]}",
+                status_code=r.status_code,
+            )
+        try:
+            order = r.json()
+        except ValueError as e:
+            raise OrderError(
+                f"Resposta inválida (não-JSON) ao buscar trade {order_id}: {e}",
+            )
+
+        logger.info(
+            "GET_TRADE: id=%s status=%s profit=%s",
+            order.get("id"),
+            order.get("status"),
+            order.get("profit"),
+        )
+
+        return order
 
     @staticmethod
     def _expiration_to_timeframe(seconds: int) -> str:
@@ -518,22 +584,36 @@ class PumaDaemon:
         return order_result
 
     def get_ws2_session(self, force_refresh: bool = False) -> str:
-        """Retorna o server_name_session cookie para WS2.
-        
-        Se force_refresh=True ou o cookie não estiver disponível, faz re-login
-        para obter um cookie fresco. Inclui circuit breaker para evitar loops
+        """Retorna o JWT accessToken como token WS2.
+
+        Se force_refresh=True ou o token não estiver disponível, faz re-login
+        para obter um token fresco. Inclui circuit breaker para evitar loops
         infinitos de re-login — após MAX_RELOGIN_ATTEMPTS falhas consecutivas,
         exige login manual pelo frontend.
         """
+        import time
+        from datetime import datetime
         self._ensure_auth()
 
-        precisa_relogin = force_refresh or not self._auth.session_cookie
+        # Diagnóstico detalhado do que disparou a necessidade de re-login
+        token_presente = bool(self._auth.ws2_token)
+        token_preview = (self._auth.ws2_token[:20] + "...") if token_presente else "VAZIO"
+        trigger = "force_refresh=True (frontend)" if force_refresh else "ws2_token ausente/expirado"
+        timestamp_iso = datetime.now().isoformat(timespec='milliseconds')
+
+        logger.info(
+            "═══ GET_WS2_SESSION ═══ ts=%s | force_refresh=%s | token_presente=%s | token_preview=%s | trigger=%s",
+            timestamp_iso, force_refresh, token_presente, token_preview, trigger
+        )
+
+        precisa_relogin = force_refresh or not self._auth.ws2_token
 
         # Circuit breaker: se excedeu tentativas, bloqueia auto-recuperação
         if precisa_relogin and PumaDaemon._relogin_failures >= PumaDaemon.MAX_RELOGIN_ATTEMPTS:
             logger.warning(
-                "WS2 re-login bloqueado: %d falhas consecutivas. Exige login manual.",
+                "WS2 re-login BLOQUEADO por circuit breaker: %d falhas consecutivas (MAX=%d). Exige login manual.",
                 PumaDaemon._relogin_failures,
+                PumaDaemon.MAX_RELOGIN_ATTEMPTS,
             )
             raise AuthError(
                 f"Re-login automático falhou {PumaDaemon._relogin_failures}x consecutivas. "
@@ -541,27 +621,63 @@ class PumaDaemon:
             )
 
         if precisa_relogin:
-            logger.info("WS2 session cookie ausente/expirado — refazendo login para obter cookie fresco")
-            try:
-                self._auth.login()
-                self._ensure_token()
-                PumaDaemon._relogin_failures = 0  # reset no sucesso
-                logger.info("WS2 re-login automático OK — cookie renovado")
-            except AuthError:
-                PumaDaemon._relogin_failures += 1
-                logger.warning(
-                    "WS2 re-login falhou (%d/%d).",
-                    PumaDaemon._relogin_failures,
-                    PumaDaemon.MAX_RELOGIN_ATTEMPTS,
+            # Reentrancy guard: apenas 1 thread faz re-login por vez
+            if PumaDaemon._relogging_in:
+                logger.info(
+                    "═══ WS2 RE-LOGIN JÁ EM ANDAMENTO (outra thread) — aguardando ═══ ts=%s",
+                    timestamp_iso
                 )
-                raise
+                with PumaDaemon._relogin_lock:
+                    pass  # espera a thread que está logando terminar
+            else:
+                with PumaDaemon._relogin_lock:
+                    if PumaDaemon._relogging_in:
+                        # Outra thread já logou enquanto esperávamos o lock
+                        logger.info("═══ WS2 RE-LOGIN já feito por outra thread ═══ ts=%s", timestamp_iso)
+                    else:
+                        PumaDaemon._relogging_in = True
+                        try:
+                            logger.info("═══ WS2 RE-LOGIN INICIADO ═══ ts=%s | trigger=%s | tentativas_anteriores=%d/%d",
+                                       timestamp_iso, trigger, PumaDaemon._relogin_failures, PumaDaemon.MAX_RELOGIN_ATTEMPTS)
+                            login_start = time.perf_counter()
+                            self._auth.login()
+                            self._ensure_token()
+                            login_elapsed = round((time.perf_counter() - login_start) * 1000)
+                            PumaDaemon._relogin_failures = 0  # reset no sucesso
+                            token_novo = self._auth.ws2_token
+                            token_novo_preview = (token_novo[:20] + "...") if token_novo else "VAZIO"
+                            logger.info("═══ WS2 RE-LOGIN SUCESSO ═══ duracao_ms=%d | novo_token=%s",
+                                       login_elapsed, token_novo_preview)
+                        except AuthError as e:
+                            login_elapsed = round((time.perf_counter() - login_start) * 1000)
+                            PumaDaemon._relogin_failures += 1
+                            error_detail = str(e)
+                            if hasattr(e, 'response_body') and e.response_body:
+                                error_detail += f" | response_body={e.response_body}"
+                            logger.warning(
+                                "═══ WS2 RE-LOGIN FALHOU ═══ ts=%s | duracao_ms=%d | tentativa=%d/%d | erro=%s",
+                                datetime.now().isoformat(timespec='milliseconds'),
+                                login_elapsed,
+                                PumaDaemon._relogin_failures,
+                                PumaDaemon.MAX_RELOGIN_ATTEMPTS,
+                                error_detail,
+                            )
+                            raise
+                        finally:
+                            PumaDaemon._relogging_in = False
 
-        token = self._auth.session_cookie
+        token = self._auth.ws2_token
         if not token:
             PumaDaemon._relogin_failures += 1
-            raise AuthError(
-                "Cookie server_name_session não disponível mesmo após re-login"
+            logger.error(
+                "WS2: accessToken AUSENTE mesmo após re-login bem-sucedido | tentativas=%d",
+                PumaDaemon._relogin_failures,
             )
+            raise AuthError(
+                "WS2 token (accessToken) não disponível mesmo após re-login"
+            )
+
+        logger.info("WS2 token retornado (len=%d, preview=%s...)", len(token), token[:20])
         return token
 
     def get_history(self, symbol: str, resolution: str, from_ts: str, to_ts: str) -> dict:
@@ -721,8 +837,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path == "/trades":
                 body = self._read_body()
                 result = daemon.place_trade(body)
+                trade_id = result.get("id", "")
+                logger.info(
+                    "🔍 TRADE CRIADA | asset=%s dir=%s | id=%s | result_full=%s",
+                    body.get("asset"), body.get("direction"),
+                    trade_id,
+                    json.dumps(result, ensure_ascii=False, default=str),
+                )
                 self._send(200, {
-                    "id": result.get("id", ""),
+                    "id": trade_id,
                     "status": result.get("status", "ACTIVE"),
                 })
 
@@ -836,7 +959,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send(401, {"error": str(e)})
         except OrderError as e:
             logger.warning("Erro de ordem em GET %s: %s", path, e)
-            self._send(400, {"error": str(e)})
+            status = e.status_code if e.status_code in (400, 404, 422, 429) else 400
+            self._send(status, {"error": str(e)})
         except Exception as e:
             logger.error("Erro em GET %s: %s", path, e)
             self._send(500, {"error": str(e)})

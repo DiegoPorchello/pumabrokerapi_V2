@@ -1,1 +1,69 @@
-{"enabled": true, "accounts": [{"id": "copy_1783551621203_0", "label": "Fernanda Real", "email": "fernandalopestorres1@gmail.com", "password": "Semsenh@123", "is_demo": false, "active": false, "last_error": null, "last_sync_at": null, "initial_balance": 100.0, "total_trades": 0, "total_wins": 0, "total_losses": 0, "total_profit": 0.0, "started_at": "2026-07-08T20:00:21.203213"}, {"id": "copy_1783551667542_1", "label": "Diego Demo", "email": "diegoporchello@gmail.com", "password": "Semsenh@123", "is_demo": true, "active": false, "last_error": null, "last_sync_at": null, "initial_balance": 11312.79, "total_trades": 0, "total_wins": 0, "total_losses": 0, "total_profit": 0.0, "started_at": "2026-07-08T20:01:07.542381"}, {"id": "copy_1783551719692_2", "label": "Danilo Demo", "email": "mercadofinanceirotrader01@gmail.com", "password": "Sara14#", "is_demo": true, "active": true, "last_error": null, "last_sync_at": null, "initial_balance": 10000.0, "total_trades": 0, "total_wins": 0, "total_losses": 0, "total_profit": 0.0, "started_at": "2026-07-08T20:01:59.692267"}, {"id": "copy_1783551791807_3", "label": "Alle Demo", "email": "alekonnem@gmail.com", "password": "Sonhador00@", "is_demo": true, "active": true, "last_error": null, "last_sync_at": null, "initial_balance": 10001.6, "total_trades": 0, "total_wins": 0, "total_losses": 0, "total_profit": 0.0, "started_at": "2026-07-08T20:03:11.807442"}]}
+{
+  "enabled": false,
+  "accounts": [
+    {
+      "id": "copy_1783551621203_0",
+      "label": "Fernanda Real",
+      "email": "fernandalopestorres1@gmail.com",
+      "password": "Semsenh@123",
+      "is_demo": false,
+      "active": false,
+      "last_error": null,
+      "last_sync_at": null,
+      "initial_balance": 100.0,
+      "total_trades": 0,
+      "total_wins": 0,
+      "total_losses": 0,
+      "total_profit": 0.0,
+      "started_at": "2026-07-08T20:00:21.203213"
+    },
+    {
+      "id": "copy_1783551667542_1",
+      "label": "Diego Demo",
+      "email": "diegoporchello@gmail.com",
+      "password": "Semsenh@123",
+      "is_demo": true,
+      "active": false,
+      "last_error": null,
+      "last_sync_at": null,
+      "initial_balance": 11312.79,
+      "total_trades": 0,
+      "total_wins": 0,
+      "total_losses": 0,
+      "total_profit": 0.0,
+      "started_at": "2026-07-08T20:01:07.542381"
+    },
+    {
+      "id": "copy_1783551719692_2",
+      "label": "Danilo Demo",
+      "email": "mercadofinanceirotrader01@gmail.com",
+      "password": "Sara14#",
+      "is_demo": true,
+      "active": true,
+      "last_error": null,
+      "last_sync_at": null,
+      "initial_balance": 10000.0,
+      "total_trades": 0,
+      "total_wins": 0,
+      "total_losses": 0,
+      "total_profit": 0.0,
+      "started_at": "2026-07-08T20:01:59.692267"
+    },
+    {
+      "id": "copy_1783551791807_3",
+      "label": "Alle Demo",
+      "email": "alekonnem@gmail.com",
+      "password": "Sonhador00@",
+      "is_demo": true,
+      "active": true,
+      "last_error": null,
+      "last_sync_at": null,
+      "initial_balance": 10001.6,
+      "total_trades": 0,
+      "total_wins": 0,
+      "total_losses": 0,
+      "total_profit": 0.0,
+      "started_at": "2026-07-08T20:03:11.807442"
+    }
+  ]
+}

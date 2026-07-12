@@ -1,17 +1,18 @@
 """
 ws_proxy.py — WebSocket proxy para WS2 (Puma Broker).
 
-O browser não pode enviar headers customizados (Cookie) em conexões WebSocket.
-Este proxy aceita conexões do frontend e as encaminha para wss://wsmt5.pumabroker.com/
-com o header Cookie correto.
+O WS2 da Puma (wsmt5.pumabroker.com) exige uma mensagem AUTH explicita
+logo apos a conexao, com uma chave estatica compartilhada.
+
+Fluxo:
+  1. Frontend conecta: ws://127.0.0.1:3002
+  2. Proxy conecta:    wss://wsmt5.pumabroker.com/
+  3. Proxy envia:      {"method":"AUTH","params":{"key":"<KEY>"}}
+  4. WS2 responde:     {"type":"auth","status":"ok","broker":"pepperstone",...}
+  5. So entao as mensagens sao encaminhadas bidirecionalmente
 
 Uso:
   python ws_proxy.py --port 3002
-
-Fluxo:
-  1. Frontend conecta: ws://127.0.0.1:3002?token=<server_name_session>
-  2. Proxy conecta:    wss://wsmt5.pumabroker.com/ (com Cookie header)
-  3. Mensagens são encaminhadas bidirecionalmente
 """
 
 import asyncio
@@ -19,7 +20,6 @@ import json
 import logging
 import signal
 import sys
-from urllib.parse import urlparse, parse_qs
 
 import websockets
 from websockets.server import serve, WebSocketServerProtocol
@@ -32,42 +32,20 @@ logging.basicConfig(
 logger = logging.getLogger("ws_proxy")
 
 PUMA_WS2_URL = "wss://wsmt5.pumabroker.com/"
-SESSION_COOKIE = "server_name_session"
 
-# Armazena tokens dos clientes conectados
-_client_tokens: dict[str, str] = {}
+# Chave estatica de autenticacao WS2 (descoberta via DevTools do site real)
+# Compartilhada entre todos os clientes white-label MT5/Pepperstone
+WS2_AUTH_KEY = "mt5_4mkts_pepperstone_2025_pP9sXrL7kN2"
+
+AUTH_TIMEOUT = 10  # segundos para aguardar resposta do AUTH
 
 
 async def _proxy_handler(client_ws: WebSocketServerProtocol):
     """Handler principal do proxy WebSocket."""
-    # Extrai token da query string
-    query = parse_qs(client_ws.path.split("?")[1] if "?" in client_ws.path else "")
-    token = query.get("token", [None])[0]
-
-    if not token:
-        logger.warning("Conexão sem token — rejeitando")
-        await client_ws.close(4001, "Token obrigatório")
-        return
-
     client_id = str(id(client_ws))
-    _client_tokens[client_id] = token
+    logger.info("Cliente conectado (id=%s)", client_id)
 
-    token_preview = token[:20] + "..." if len(token) > 20 else token
-    logger.info(
-        "Cliente conectado (id=%s, token_len=%d, preview=%s)",
-        client_id, len(token), token_preview,
-    )
-    # Aviso se o token parece ser JWT (eyJ) em vez de session hash
-    if token.startswith("eyJ"):
-        logger.warning(
-            "⚠️ Token parece ser JWT (%s...), não server_name_session. "
-            "WS2 provavelmente rejeitará 'Not authenticated'.",
-            token[:30],
-        )
-
-    # Conecta ao Puma WS2 com Cookie header
     headers = {
-        "Cookie": f"{SESSION_COOKIE}={token}",
         "Origin": "https://trade.pumabroker.com",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -77,6 +55,7 @@ async def _proxy_handler(client_ws: WebSocketServerProtocol):
     }
 
     try:
+        logger.info("Conectando ao WS2 sem autenticacao previa...")
         async with websockets.connect(
             PUMA_WS2_URL,
             additional_headers=headers,
@@ -84,13 +63,46 @@ async def _proxy_handler(client_ws: WebSocketServerProtocol):
             ping_interval=None,
             close_timeout=5,
         ) as puma_ws:
-            logger.info("Conectado ao Puma WS2 (client=%s, cookie_preview=%s)", client_id, token_preview)
+            logger.info("Conectado ao Puma WS2 (client=%s)", client_id)
 
-            # Contador de mensagens para logging
+            # ── FASE 1: AUTH (antes de qualquer outra mensagem) ──
+            auth_msg = json.dumps({
+                "method": "AUTH",
+                "params": {"key": WS2_AUTH_KEY},
+            })
+            logger.info("→ Enviando AUTH...")
+            await puma_ws.send(auth_msg)
+
+            # Aguarda resposta do AUTH
+            autenticado = False
+            try:
+                auth_resp = await asyncio.wait_for(puma_ws.recv(), timeout=AUTH_TIMEOUT)
+                if isinstance(auth_resp, bytes):
+                    auth_resp = auth_resp.decode("utf-8")
+                data = json.loads(auth_resp)
+                if data.get("type") == "auth" and data.get("status") == "ok":
+                    autenticado = True
+                    broker = data.get("broker", "?")
+                    symbols = data.get("symbols", [])
+                    logger.info(
+                        "AUTH OK | broker=%s | symbols=%d | raw=%s",
+                        broker, len(symbols), auth_resp[:300],
+                    )
+                    # Repassa a resposta de auth para o cliente
+                    await client_ws.send(auth_resp)
+                else:
+                    logger.error("AUTH FALHOU: %s", auth_resp[:500])
+                    await client_ws.close(4002, f"AUTH falhou: {auth_resp[:200]}")
+                    return
+            except asyncio.TimeoutError:
+                logger.error("AUTH TIMEOUT (%ds) — servidor nao respondeu", AUTH_TIMEOUT)
+                await client_ws.close(4002, "AUTH timeout")
+                return
+
+            # ── FASE 2: Encaminhamento bidirecional ──
             msg_count = 0
             sent_count = 0
 
-            # Tarefa para encaminhar mensagens: Puma → Cliente
             async def puma_to_client():
                 nonlocal msg_count
                 try:
@@ -98,25 +110,14 @@ async def _proxy_handler(client_ws: WebSocketServerProtocol):
                         if isinstance(msg, bytes):
                             msg = msg.decode("utf-8")
                         msg_count += 1
-                        # Log específico para erros de autenticação
-                        if "Not authenticated" in msg or "error" in msg.lower():
-                            logger.warning(
-                                "← PUMA WS2 [%d] ⚠️ ERRO: %s (cookie: %s)",
-                                msg_count, msg[:300], token_preview,
-                            )
-                        else:
-                            truncated = msg[:1000] + f"... [{len(msg)} chars]" if len(msg) > 1000 else msg
-                            logger.info(
-                                "← PUMA WS2 [%d] (%d chars): %s",
-                                msg_count, len(msg), truncated,
-                            )
+                        truncated = msg[:1000] + f"... [{len(msg)} chars]" if len(msg) > 1000 else msg
+                        logger.info("← PUMA WS2 [%d]: %s", msg_count, truncated)
                         await client_ws.send(msg)
                 except websockets.ConnectionClosed:
                     logger.info("Puma WS2 desconectou (client=%s, received=%d)", client_id, msg_count)
                 except Exception as e:
                     logger.error("Erro puma_to_client: %s", e)
 
-            # Tarefa para encaminhar mensagens: Cliente → Puma
             async def client_to_puma():
                 nonlocal sent_count
                 try:
@@ -125,17 +126,13 @@ async def _proxy_handler(client_ws: WebSocketServerProtocol):
                             msg = msg.decode("utf-8")
                         sent_count += 1
                         truncated = msg[:1000] + f"... [{len(msg)} chars]" if len(msg) > 1000 else msg
-                        logger.info(
-                            "→ CLIENT [%d] → PUMA: %s",
-                            sent_count, truncated,
-                        )
+                        logger.info("→ CLIENT [%d] → PUMA: %s", sent_count, truncated)
                         await puma_ws.send(msg)
                 except websockets.ConnectionClosed:
                     pass
                 except Exception as e:
                     logger.error("Erro client_to_puma: %s", e)
 
-            # Executa ambas as direções em paralelo
             done, pending = await asyncio.wait(
                 [
                     asyncio.create_task(puma_to_client()),
@@ -144,14 +141,12 @@ async def _proxy_handler(client_ws: WebSocketServerProtocol):
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            # Cancela tarefas restantes
             for task in pending:
                 task.cancel()
 
     except Exception as e:
-        logger.error("Erro na conexão Puma WS2: %s", e)
+        logger.error("Erro na conexao Puma WS2: %s", e)
     finally:
-        _client_tokens.pop(client_id, None)
         logger.info("Cliente desconectado (id=%s)", client_id)
 
 
@@ -168,7 +163,7 @@ async def main(host: str = "127.0.0.1", port: int = 3002):
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            pass  # Windows não suporta add_signal_handler
+            pass
 
     async with serve(
         _proxy_handler,
@@ -181,8 +176,8 @@ async def main(host: str = "127.0.0.1", port: int = 3002):
         logger.info("  Puma WS2 Proxy")
         logger.info("  ws://%s:%d", host, port)
         logger.info("=" * 50)
-        logger.info("Frontend conecta: ws://127.0.0.1:%d?token=<session_cookie>", port)
-        logger.info("Proxy encaminha:  %s", PUMA_WS2_URL)
+        logger.info("Autenticacao: mensagem AUTH com chave estatica")
+        logger.info("Proxy encaminha: %s", PUMA_WS2_URL)
         logger.info("")
         await stop.wait()
 

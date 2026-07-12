@@ -61,35 +61,37 @@ Content-Type: application/json
 ```
 
 **Payload confirmado (16/06/2026):**
+
 ```json
 {
-  "email":    "usuario@email.com",
+  "email": "usuario@email.com",
   "password": "senha"
 }
 ```
 
 **Response confirmada:**
+
 ```json
 {
   "user": {
-    "id":           "28318",
-    "email":        "usuario@email.com",
-    "name":         "NOME COMPLETO",
-    "firstName":    "NOME",
-    "lastName":     "SOBRENOME",
-    "balance":      0,
-    "demoBalance":  9998,
-    "bonus":        18.97,
-    "isDemo":       true,
-    "isVip":        true,
-    "vipLevel":     1,
-    "verified":     true,
-    "country":      "BR",
-    "realTrades":   325,
-    "rollover":     5182.6,
-    "rolloverTotal":275000,
-    "depositos":    600,
-    "winrate":      0,
+    "id": "28318",
+    "email": "usuario@email.com",
+    "name": "NOME COMPLETO",
+    "firstName": "NOME",
+    "lastName": "SOBRENOME",
+    "balance": 0,
+    "demoBalance": 9998,
+    "bonus": 18.97,
+    "isDemo": true,
+    "isVip": true,
+    "vipLevel": 1,
+    "verified": true,
+    "country": "BR",
+    "realTrades": 325,
+    "rollover": 5182.6,
+    "rolloverTotal": 275000,
+    "depositos": 600,
+    "winrate": 0,
     "displayCurrency": "BRL"
   },
   "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
@@ -112,6 +114,7 @@ O JWT expira em ~24h. Para renovar, basta chamar `POST /login` novamente com as 
 ## REST API
 
 Todos os endpoints REST usam:
+
 ```
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
@@ -120,19 +123,19 @@ Origin: https://trade.pumabroker.com
 
 ### Endpoints confirmados
 
-| Método | Endpoint | Descrição |
-|--------|----------|-----------|
-| POST | `/login` | Autenticação — retorna JWT |
-| GET | `/me` | Perfil do usuário |
-| GET | `/accounts` | Lista de contas |
-| GET | `/balance` | Saldo atual |
-| GET | `/settings` | Configurações |
-| GET | `/active` | Ativos disponíveis |
-| GET | `/currencies` | Moedas disponíveis |
-| GET | `/status` | Status da plataforma |
-| GET | `/notifications` | Notificações |
-| POST | `/trades` | **Abrir ordem** |
-| GET | `/api/v1/tradingview/history` | **Histórico de candles** |
+| Método | Endpoint                      | Descrição                  |
+| ------ | ----------------------------- | -------------------------- |
+| POST   | `/login`                      | Autenticação — retorna JWT |
+| GET    | `/me`                         | Perfil do usuário          |
+| GET    | `/accounts`                   | Lista de contas            |
+| GET    | `/balance`                    | Saldo atual                |
+| GET    | `/settings`                   | Configurações              |
+| GET    | `/active`                     | Ativos disponíveis         |
+| GET    | `/currencies`                 | Moedas disponíveis         |
+| GET    | `/status`                     | Status da plataforma       |
+| GET    | `/notifications`              | Notificações               |
+| POST   | `/trades`                     | **Abrir ordem**            |
+| GET    | `/api/v1/tradingview/history` | **Histórico de candles**   |
 
 ---
 
@@ -159,22 +162,25 @@ Authorization: Bearer <jwt_token>
 | `to` | int | Unix timestamp fim | `1783267324` |
 
 **Response — formato TradingView (arrays paralelos):**
+
 ```json
 {
   "s": "ok",
   "t": [1783247520, 1783247580, 1783247640],
-  "o": [50.68, 50.70, 50.65],
-  "h": [50.72, 50.75, 50.70],
-  "l": [50.65, 50.68, 50.60],
-  "c": [50.70, 50.65, 50.68],
+  "o": [50.68, 50.7, 50.65],
+  "h": [50.72, 50.75, 50.7],
+  "l": [50.65, 50.68, 50.6],
+  "c": [50.7, 50.65, 50.68],
   "v": [190.0, 210.0, 175.0]
 }
 ```
 
 **Quando retorna vazio:**
+
 ```json
 { "s": "no_data" }
 ```
+
 Causa: período sem dados (mercado fechado, fim de semana, fora do horário do ativo).
 Fix: ampliar o range `from` para cobrir mais tempo.
 
@@ -191,19 +197,20 @@ Content-Type: application/json
 ```
 
 **Payload completo confirmado (capturado ao clicar COMPRA em AUDUSD M15):**
+
 ```json
 {
-  "userId":     "28318",
-  "symbol":     "AUDUSD",
-  "direction":  "CALL",
-  "amount":     2,
-  "duration":   530,
+  "userId": "28318",
+  "symbol": "AUDUSD",
+  "direction": "CALL",
+  "amount": 2,
+  "duration": 530,
   "entryPrice": 0.70563,
-  "mode":       "CANDLE_TIME",
-  "payout":     0.85,
-  "timeframe":  "M15",
-  "verify":     "gAAAAABqMLMX8x8KnN21gQRKFTf...",
-  "wallet":     "REAL"
+  "mode": "CANDLE_TIME",
+  "payout": 0.85,
+  "timeframe": "M15",
+  "verify": "gAAAAABqMLMX8x8KnN21gQRKFTf...",
+  "wallet": "REAL"
 }
 ```
 
@@ -239,7 +246,7 @@ Content-Type: application/json
 
 **URL:** `wss://wsm5.pumabroker.com/`  
 **Protocolo:** WebSocket puro (não Socket.IO)  
-**Auth:** Cookie `server_name_session` no handshake  
+**Auth:** Cookie `server_name_session` no handshake
 
 ### ⚠️ Limitação do Browser
 
@@ -255,6 +262,7 @@ ws_proxy.py → wss://wsm5.pumabroker.com/ com Cookie: server_name_session=<toke
 ### Frames recebidos
 
 **bar_update** (candle em tempo real):
+
 ```json
 {
   "type":     "bar_update",
@@ -273,6 +281,7 @@ ws_proxy.py → wss://wsm5.pumabroker.com/ com Cookie: server_name_session=<toke
 ```
 
 **server_time** (heartbeat):
+
 ```json
 { "type": "server_time", "timestamp": 1781557272731 }
 ```
@@ -280,6 +289,7 @@ ws_proxy.py → wss://wsm5.pumabroker.com/ com Cookie: server_name_session=<toke
 ### Frames enviados
 
 **Heartbeat** (a cada 10s):
+
 ```json
 { "method": "server_time" }
 ```
@@ -290,7 +300,7 @@ ws_proxy.py → wss://wsm5.pumabroker.com/ com Cookie: server_name_session=<toke
 
 **URL:** `wss://trade.pumabroker.com/socket.io/?EIO=4&transport=websocket`  
 **Protocolo:** Socket.IO v4 (Engine.IO v4)  
-**Auth:** Cookie `server_name_session` no handshake  
+**Auth:** Cookie `server_name_session` no handshake
 
 ### Handshake completo
 
@@ -354,18 +364,18 @@ ws_proxy.py → wss://wsm5.pumabroker.com/ com Cookie: server_name_session=<toke
 
 ### Arquivos
 
-| Arquivo | Porta | Função |
-|---------|-------|--------|
-| `pumabroker-api/proxy_daemon.py` | 3001 | Proxy REST — history, trades |
-| `pumabroker-api/ws_proxy.py` | 3002 | Proxy WebSocket — wsm5 candles |
+| Arquivo                          | Porta | Função                         |
+| -------------------------------- | ----- | ------------------------------ |
+| `pumabroker-api/proxy_daemon.py` | 3001  | Proxy REST — history, trades   |
+| `pumabroker-api/ws_proxy.py`     | 3002  | Proxy WebSocket — wsm5 candles |
 
 ### Scripts npm (package.json)
 
 ```json
 {
-  "daemon":    "python pumabroker-api/proxy_daemon.py",
-  "wsproxy":   "python pumabroker-api/ws_proxy.py --port 3002",
-  "services":  "start.bat",
+  "daemon": "python pumabroker-api/proxy_daemon.py",
+  "wsproxy": "python pumabroker-api/ws_proxy.py --port 3002",
+  "services": "start.bat",
   "start:all": "npm run services && timeout /t 3 /nobreak && npm run dev"
 }
 ```
@@ -389,6 +399,7 @@ Browser recebe bar_update normalmente
 ### 1. getCandles retorna vazio — symbol com typo
 
 **Erro:**
+
 ```
 [WARN] getCandles VAZIO: XRPDOGUSDT
 [WARN] BLOQUEADO — poucos dados (mínimo: 70), count: 0
@@ -403,6 +414,7 @@ Browser recebe bar_update normalmente
 ### 2. WS2 retorna "Not authenticated"
 
 **Erro:**
+
 ```
 {"method":"subscribe",...} → "error": "Not authenticated"
 {"method":"history",...}  → "error": "Not authenticated"
@@ -414,11 +426,11 @@ Browser recebe bar_update normalmente
 ```typescript
 // puma-broker-adapter.ts linha 496
 const ws2 = new PumaWs2Client({
-  token:    ws2Token,
-  assets:   activeHybrids,
+  token: ws2Token,
+  assets: activeHybrids,
   interval: "1",
-  debug:    true,
-  useProxy: true,   // ← FIX
+  debug: true,
+  useProxy: true, // ← FIX
 });
 ```
 
@@ -461,6 +473,7 @@ npm run start:all
 ```
 
 Sobe na ordem:
+
 1. `proxy_daemon.py` (porta 3001)
 2. `ws_proxy.py` (porta 3002) — aguarda 3s
 3. `npm run dev` (frontend) — aguarda 3s
@@ -481,6 +494,7 @@ npm run dev
 ### Verificação
 
 Após subir, confirmar no console do browser:
+
 ```
 [WS2] Conectado via proxy ws://127.0.0.1:3002
 _fetchHybridHistory: XRDOGUSDT — 200 candles alimentados no buffer
@@ -495,12 +509,12 @@ _fetchHybridHistory: XRDOGUSDT — 200 candles alimentados no buffer
 
 ```typescript
 interface Candle {
-  timestamp: number;  // unix seconds
-  open:      number;
-  high:      number;
-  low:       number;
-  close:     number;
-  volume:    number;
+  timestamp: number; // unix seconds
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
 }
 ```
 
@@ -508,19 +522,19 @@ interface Candle {
 
 ```typescript
 interface TradeUpdate {
-  id:         string;
-  uid?:       string;
-  userId?:    string;
-  symbol:     string;
-  currency?:  string;
-  direction:  "CALL" | "PUT";
-  amount:     number;
+  id: string;
+  uid?: string;
+  userId?: string;
+  symbol: string;
+  currency?: string;
+  direction: "CALL" | "PUT";
+  amount: number;
   entryPrice?: number;
-  exitPrice?:  number | null;
-  profit?:    number;
-  payout?:    number;        // 0.87 = 87%
-  status:     "ACTIVE" | "WIN" | "LOSS" | "DRAW";
-  isDemo?:    boolean;
+  exitPrice?: number | null;
+  profit?: number;
+  payout?: number; // 0.87 = 87%
+  status: "ACTIVE" | "WIN" | "LOSS" | "DRAW";
+  isDemo?: boolean;
 }
 ```
 
@@ -528,17 +542,17 @@ interface TradeUpdate {
 
 ```typescript
 interface OrderRequest {
-  userId:     string;
-  symbol:     string;
-  direction:  "CALL" | "PUT";
-  amount:     number;
-  duration:   number;        // segundos até expiração
+  userId: string;
+  symbol: string;
+  direction: "CALL" | "PUT";
+  amount: number;
+  duration: number; // segundos até expiração
   entryPrice: number;
-  mode:       "CANDLE_TIME"; // fixo
-  payout:     number;        // ex: 0.85
-  timeframe:  string;        // "M1"|"M5"|"M15"|"M30"|"H1"
-  verify:     string;        // token anti-fraude
-  wallet:     "REAL" | "DEMO";
+  mode: "CANDLE_TIME"; // fixo
+  payout: number; // ex: 0.85
+  timeframe: string; // "M1"|"M5"|"M15"|"M30"|"H1"
+  verify: string; // token anti-fraude
+  wallet: "REAL" | "DEMO";
 }
 ```
 
@@ -546,19 +560,19 @@ interface OrderRequest {
 
 ```typescript
 interface BarUpdate {
-  type:     "bar_update";
-  symbol:   string;
-  interval: string;    // "1", "5", "15", "30", "60"
-  bar:      Bar;
+  type: "bar_update";
+  symbol: string;
+  interval: string; // "1", "5", "15", "30", "60"
+  bar: Bar;
   last_bar?: Bar;
 }
 
 interface Bar {
-  time:   number;  // unix seconds
-  open:   number;
-  high:   number;
-  low:    number;
-  close:  number;
+  time: number; // unix seconds
+  open: number;
+  high: number;
+  low: number;
+  close: number;
   volume: number;
 }
 ```
@@ -567,12 +581,12 @@ interface Bar {
 
 ## Cookies e Headers
 
-| Nome | Onde | Valor | Uso |
-|------|------|-------|-----|
-| `server_name_session` | Cookie | `cd0dc3ba...` | Autenticação WS2 e Socket.IO |
-| `Authorization` | Header | `Bearer eyJhbGci...` | Todos os REST requests |
+| Nome                  | Onde   | Valor                | Uso                          |
+| --------------------- | ------ | -------------------- | ---------------------------- |
+| `server_name_session` | Cookie | `cd0dc3ba...`        | Autenticação WS2 e Socket.IO |
+| `Authorization`       | Header | `Bearer eyJhbGci...` | Todos os REST requests       |
 
 ---
 
-*Documentação baseada em capturas reais do DevTools — Junho/Julho 2026*  
-*Nunca compartilhe seus tokens JWT ou session cookies publicamente*
+_Documentação baseada em capturas reais do DevTools — Junho/Julho 2026_  
+_Nunca compartilhe seus tokens JWT ou session cookies publicamente_
