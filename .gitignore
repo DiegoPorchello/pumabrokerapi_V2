@@ -1,3 +1,5 @@
-.env
-__pycache__/
-node_modules/
+﻿puma_tokens.json
+active_trades.db
+*.log
+*.err
+test_server.py

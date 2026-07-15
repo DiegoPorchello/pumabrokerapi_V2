@@ -1,35 +1,998 @@
-"""
-proxy_daemon.py
-Daemon HTTP que faz proxy das chamadas REST para a Puma Broker API.
-
-Elimina problemas de CORS/Origin/405 que ocorrem quando o frontend
-chama a API diretamente via Vite proxy.
-
-Uso:
-  python proxy_daemon.py --port 3001
-
-Endpoints:
-  POST /login      → Autentica e retorna {user, token, ws2Session}
-  GET  /balance    → Saldo da conta
-  GET  /active     → Ativos disponíveis
-  POST /trades     → Abrir ordem
-  GET  /trades/<id> → Status de uma ordem
-  GET  /ws2-session → JWT accessToken (server_name_session) para WS2
-  GET  /health     → Health check
-"""
-
-import asyncio
 import json
-import logging
 import os
 import sys
+import logging
 import threading
 import time
+import sqlite3
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict, fields
+from typing import Optional, Dict, Any, List, Callable
 from collections import deque
-from datetime import datetime
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+# Add parent directory for imports
+sys.path.insert(0, os.path.dirname(__file__))
+
+import asyncio
+import socketio
 from dotenv import load_dotenv
+
+load_dotenv()
+from pumabroker.auth import PumaBrokerAuth, AuthError
+from pumabroker.token_manager import TokenManager, get_token_manager
+from pumabroker.api import TradesAPI, OrderError
+from pumabroker.config import config
+# ============================================================
+# RECOVERY MANAGER CLASSES (embedded for self-contained daemon)
+# ============================================================
+
+class TradeStatusEnum:
+    PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    WIN = "WIN"
+    LOSS = "LOSS"
+    DRAW = "DRAW"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+@dataclass
+class ActiveTrade:
+    """
+    Represents an active trade being monitored.
+    All timestamps in UTC (ISO 8601 with 'Z' suffix).
+    
+    State machine:
+      ACTIVE → (expiresAt + 30s) → WAITING_RESULT → (tradeResult) → WIN/LOSS/DRAW
+      WAITING_RESULT → (5min without tradeResult) → ORPHAN
+    """
+    id: str
+    uid: str = ""  # Puma internal UID
+    user_id: str = ""  # Puma userId
+    symbol: str = ""
+    direction: str = ""  # "CALL" or "PUT"
+    amount: float = 0.0
+    entry_price: float = 0.0
+    payout: float = 0.0
+    status: str = "ACTIVE"  # ACTIVE, WAITING_RESULT, WIN, LOSS, DRAW, ORPHAN
+    profit: float = 0.0
+    gross_profit: float = 0.0  # profit before fees
+    net_profit: float = 0.0  # profit after fees (same as profit usually)
+    opened_at: str = ""  # UTC ISO format
+    expires_at: str = ""  # UTC ISO format
+    closed_at: str = ""  # UTC ISO format
+    exit_price: float = 0.0
+    wallet: str = "REAL"  # "REAL" or "DEMO"
+    trade_mode: str = ""  # "real", "demo", etc.
+    duration: int = 0  # trade duration in seconds
+    timeframe: str = "M1"
+    verify_token: str = ""
+    created_at: str = ""  # When we first learned about this trade
+    updated_at: str = ""  # Last update timestamp
+    result: str = ""  # "WON"/"LOST"/"DRAW" raw from tradeResult payload
+    new_balance: float = 0.0  # Balance after trade from tradeResult payload
+
+    def __post_init__(self):
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        if not self.created_at:
+            self.created_at = now
+        if not self.updated_at:
+            self.updated_at = now
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ActiveTrade":
+        # Filter out unknown keys for forward compatibility
+        valid = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid})
+
+    def is_expired(self, grace_seconds: int = 30) -> bool:
+        """Check if trade has expired (with grace period)"""
+        if not self.expires_at:
+            return False
+        try:
+            exp = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            return (now - exp).total_seconds() > grace_seconds
+        except Exception:
+            return False
+
+    def is_active(self) -> bool:
+        return self.status.upper() in ("PENDING", "ACTIVE")
+
+    def is_waiting_result(self) -> bool:
+        return self.status.upper() == "WAITING_RESULT"
+
+    def is_final(self) -> bool:
+        return self.status.upper() in ("WIN", "LOSS", "DRAW")
+
+    def is_orphan(self) -> bool:
+        return self.status.upper() == "ORPHAN"
+
+
+class PersistenceManager:
+    """
+    Handles local persistence of active trades using SQLite.
+    Thread-safe with connection pooling.
+    """
+
+    DB_FILE = "active_trades.db"
+    SCHEMA_VERSION = 2
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or "active_trades.db"
+        self._lock = threading.RLock()
+        self._init_db()
+
+    def _init_db(self):
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS active_trades (
+                        id TEXT PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        amount REAL NOT NULL,
+                        entry_price REAL NOT NULL,
+                        payout REAL NOT NULL,
+                        status TEXT NOT NULL,
+                        profit REAL DEFAULT 0.0,
+                        opened_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        closed_at TEXT DEFAULT '',
+                        exit_price REAL DEFAULT 0.0,
+                        wallet TEXT DEFAULT 'REAL',
+                        timeframe TEXT DEFAULT 'M1',
+                        verify_token TEXT DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        result TEXT DEFAULT '',
+                        new_balance REAL DEFAULT 0.0,
+                        trade_status TEXT DEFAULT '',
+                        gross_profit REAL DEFAULT 0.0,
+                        net_profit REAL DEFAULT 0.0,
+                        trade_mode TEXT DEFAULT '',
+                        duration INTEGER DEFAULT 0
+                    )
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_active_trades_status 
+                    ON active_trades(status)
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_active_trades_expires 
+                    ON active_trades(expires_at)
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS schema_version (
+                        version INTEGER PRIMARY KEY
+                    )
+                """)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                    (2,)
+                )
+                # Migration: add new columns if they don't exist
+                for col, default in [
+                    ("result", "''"), 
+                    ("new_balance", 0.0),
+                    ("trade_status", "''"),
+                    ("gross_profit", 0.0),
+                    ("net_profit", 0.0),
+                    ("trade_mode", "''"),
+                    ("duration", 0)
+                ]:
+                    try:
+                        conn.execute(f"ALTER TABLE active_trades ADD COLUMN {col} DEFAULT {default}")
+                    except sqlite3.OperationalError:
+                        pass
+                conn.commit()
+                logger.info("PersistenceManager: Database initialized at %s", self.db_path)
+            finally:
+                conn.close()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def save(self, trade: ActiveTrade) -> bool:
+        """Save or update a trade. Returns True if inserted, False if updated."""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                existing = conn.execute("SELECT id FROM active_trades WHERE id = ?", (trade.id,)).fetchone()
+                trade.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                data = trade.to_dict()
+                
+                # trade_status alias
+                data["trade_status"] = data.get("status", "")
+                
+                if existing:
+                    conn.execute("""
+                        UPDATE active_trades SET
+                            symbol=?, direction=?, amount=?, entry_price=?, payout=?,
+                            status=?, profit=?, opened_at=?, expires_at=?, closed_at=?,
+                            exit_price=?, wallet=?, timeframe=?, verify_token=?,
+                            updated_at=?, result=?, new_balance=?, trade_status=?,
+                            gross_profit=?, net_profit=?, trade_mode=?, duration=?
+                        WHERE id=?
+                    """, (
+                        data["symbol"], data["direction"], data["amount"], data["entry_price"],
+                        data["payout"], data["status"], data["profit"], data["opened_at"],
+                        data["expires_at"], data["closed_at"], data["exit_price"],
+                        data["wallet"], data["timeframe"], data["verify_token"],
+                        data["updated_at"], data["result"], data["new_balance"],
+                        data["trade_status"], data["gross_profit"], data["net_profit"],
+                        data["trade_mode"], data["duration"],
+                        data["id"]
+                    ))
+                    conn.commit()
+                    return False
+                else:
+                    conn.execute("""
+                        INSERT INTO active_trades (
+                            id, symbol, direction, amount, entry_price, payout,
+                            status, profit, opened_at, expires_at, closed_at,
+                            exit_price, wallet, timeframe, verify_token,
+                            created_at, updated_at, result, new_balance,
+                            trade_status, gross_profit, net_profit, trade_mode, duration
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        data["id"], data["symbol"], data["direction"], data["amount"],
+                        data["entry_price"], data["payout"], data["status"], data["profit"],
+                        data["opened_at"], data["expires_at"], data["closed_at"],
+                        data["exit_price"], data["wallet"], data["timeframe"],
+                        data["verify_token"], data["created_at"], data["updated_at"],
+                        data["result"], data["new_balance"], data["trade_status"],
+                        data["gross_profit"], data["net_profit"], data["trade_mode"], data["duration"]
+                    ))
+                    conn.commit()
+                    return True
+            finally:
+                conn.close()
+
+    def delete(self, trade_id: str) -> bool:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            try:
+                cursor = conn.execute("DELETE FROM active_trades WHERE id = ?", (trade_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+            finally:
+                conn.close()
+
+    def get(self, trade_id: str) -> Optional[ActiveTrade]:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute("SELECT * FROM active_trades WHERE id = ?", (trade_id,)).fetchone()
+                if row:
+                    return ActiveTrade(**dict(row))
+                return None
+            finally:
+                conn.close()
+
+    def get_all(self) -> List[ActiveTrade]:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute("SELECT * FROM active_trades ORDER BY created_at DESC").fetchall()
+                return [ActiveTrade(**dict(row)) for row in rows]
+            finally:
+                conn.close()
+
+    def get_active(self) -> List[ActiveTrade]:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM active_trades WHERE status IN (?, ?) ORDER BY created_at DESC",
+                    ("PENDING", "ACTIVE")
+                ).fetchall()
+                return [ActiveTrade(**dict(row)) for row in rows]
+            finally:
+                conn.close()
+
+    def get_expired_active(self, grace_seconds: int = 15) -> List[ActiveTrade]:
+        """Get trades that are ACTIVE/PENDING but past their expiry + grace period"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM active_trades WHERE status IN (?, ?)",
+                    ("PENDING", "ACTIVE")
+                ).fetchall()
+                expired = []
+                for row in rows:
+                    trade = ActiveTrade(**dict(row))
+                    if trade.is_expired(grace_seconds):
+                        expired.append(trade)
+                return expired
+            finally:
+                conn.close()
+
+    def count_active(self) -> int:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM active_trades WHERE status IN (?, ?)",
+                    ("PENDING", "ACTIVE")
+                ).fetchone()
+                return row[0] if row else 0
+            finally:
+                conn.close()
+
+    def clear_all(self) -> int:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            try:
+                cursor = conn.execute("DELETE FROM active_trades")
+                conn.commit()
+                return cursor.rowcount
+            finally:
+                conn.close()
+
+    def close(self):
+        pass  # SQLite connections are per-operation
+
+
+class PersistenceManager:
+    """
+    Handles local persistence of active trades using SQLite.
+    Thread-safe with connection pooling.
+    """
+
+    DB_FILE = "active_trades.db"
+    SCHEMA_VERSION = 1
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or "active_trades.db"
+        self._lock = threading.RLock()
+        self._init_db()
+
+    def _init_db(self):
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS active_trades (
+                        id TEXT PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        amount REAL NOT NULL,
+                        entry_price REAL NOT NULL,
+                        payout REAL NOT NULL,
+                        status TEXT NOT NULL,
+                        profit REAL DEFAULT 0.0,
+                        opened_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        closed_at TEXT DEFAULT '',
+                        exit_price REAL DEFAULT 0.0,
+                        wallet TEXT DEFAULT 'REAL',
+                        timeframe TEXT DEFAULT 'M1',
+                        verify_token TEXT DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        result TEXT DEFAULT '',
+                        new_balance REAL DEFAULT 0.0
+                    )
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_active_trades_status 
+                    ON active_trades(status)
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_active_trades_expires 
+                    ON active_trades(expires_at)
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS schema_version (
+                        version INTEGER PRIMARY KEY
+                    )
+                """)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                    (1,)
+                )
+                # Migration: add new columns if they don't exist
+                for col, default in [("result", ""), ("new_balance", 0.0)]:
+                    try:
+                        conn.execute(f"ALTER TABLE active_trades ADD COLUMN {col} DEFAULT ?", (default,))
+                    except sqlite3.OperationalError:
+                        pass
+                conn.commit()
+                logger.info("PersistenceManager: Database initialized at %s", self.db_path)
+            finally:
+                conn.close()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def save(self, trade: ActiveTrade) -> bool:
+        """Save or update a trade. Returns True if inserted, False if updated."""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                existing = conn.execute("SELECT id FROM active_trades WHERE id = ?", (trade.id,)).fetchone()
+                trade.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                data = trade.to_dict()
+                if existing:
+                    conn.execute("""
+                        UPDATE active_trades SET
+                            symbol=?, direction=?, amount=?, entry_price=?, payout=?,
+                            status=?, profit=?, opened_at=?, expires_at=?, closed_at=?,
+                            exit_price=?, wallet=?, timeframe=?, verify_token=?,
+                            updated_at=?, result=?, new_balance=?
+                        WHERE id=?
+                    """, (
+                        data["symbol"], data["direction"], data["amount"], data["entry_price"],
+                        data["payout"], data["status"], data["profit"], data["opened_at"],
+                        data["expires_at"], data["closed_at"], data["exit_price"],
+                        data["wallet"], data["timeframe"], data["verify_token"],
+                        data["updated_at"], data["result"], data["new_balance"],
+                        data["id"]
+                    ))
+                    conn.commit()
+                    return False
+                else:
+                    conn.execute("""
+                        INSERT INTO active_trades (
+                            id, symbol, direction, amount, entry_price, payout,
+                            status, profit, opened_at, expires_at, closed_at,
+                            exit_price, wallet, timeframe, verify_token,
+                            created_at, updated_at, result, new_balance
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        data["id"], data["symbol"], data["direction"], data["amount"],
+                        data["entry_price"], data["payout"], data["status"], data["profit"],
+                        data["opened_at"], data["expires_at"], data["closed_at"],
+                        data["exit_price"], data["wallet"], data["timeframe"],
+                        data["verify_token"], data["created_at"], data["updated_at"],
+                        data["result"], data["new_balance"]
+                    ))
+                    conn.commit()
+                    return True
+            finally:
+                conn.close()
+
+    def delete(self, trade_id: str) -> bool:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            try:
+                cursor = conn.execute("DELETE FROM active_trades WHERE id = ?", (trade_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+            finally:
+                conn.close()
+
+    def get(self, trade_id: str) -> Optional[ActiveTrade]:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute("SELECT * FROM active_trades WHERE id = ?", (trade_id,)).fetchone()
+                if row:
+                    return ActiveTrade(**dict(row))
+                return None
+            finally:
+                conn.close()
+
+    def get_all(self) -> List[ActiveTrade]:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute("SELECT * FROM active_trades ORDER BY created_at DESC").fetchall()
+                return [ActiveTrade(**dict(row)) for row in rows]
+            finally:
+                conn.close()
+
+    def get_active(self) -> List[ActiveTrade]:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM active_trades WHERE status IN (?, ?) ORDER BY created_at DESC",
+                    ("PENDING", "ACTIVE")
+                ).fetchall()
+                return [ActiveTrade(**dict(row)) for row in rows]
+            finally:
+                conn.close()
+
+    def get_expired_active(self, grace_seconds: int = 15) -> List[ActiveTrade]:
+        """Get trades that are ACTIVE/PENDING but past their expiry + grace period"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM active_trades WHERE status IN (?, ?)",
+                    ("PENDING", "ACTIVE")
+                ).fetchall()
+                expired = []
+                for row in rows:
+                    trade = ActiveTrade(**dict(row))
+                    if trade.is_expired(grace_seconds):
+                        expired.append(trade)
+                return expired
+            finally:
+                conn.close()
+
+    def count_active(self) -> int:
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM active_trades WHERE status IN (?, ?)",
+                    ("PENDING", "ACTIVE")
+                ).fetchone()
+                return row[0] if row else 0
+            finally:
+                conn.close()
+
+    def clear_all(self) -> int:
+        with self.__lock:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            try:
+                cursor = conn.execute("DELETE FROM active_trades")
+                conn.commit()
+                return cursor.rowcount
+            finally:
+                conn.close()
+
+
+class TradeManager:
+    """
+    Manages trade lifecycle - open, update, close, query.
+    Uses PersistenceManager for durability.
+    """
+
+    def __init__(self, persistence: PersistenceManager, api_client: Any):
+        self.persistence = persistence
+        self.api_client = api_client
+        self._lock = threading.RLock()
+        self._active_trades: Dict[str, ActiveTrade] = {}
+        self._callbacks: List[Callable[[ActiveTrade], None]] = []
+
+    def add_callback(self, callback: Callable[[ActiveTrade], None]):
+        self._callbacks.append(callback)
+
+    def _notify(self, trade: ActiveTrade):
+        for cb in self._callbacks:
+            try:
+                cb(trade)
+            except Exception as e:
+                logger.error("TradeManager callback error: %s", e)
+
+    def load_from_persistence(self) -> int:
+        """Load all trades from persistence into memory"""
+        with self._lock:
+            trades = self.persistence.get_all()
+            self._active_trades = {t.id: t for t in trades}
+            logger.info("TradeManager: Loaded %d trades from persistence", len(trades))
+            return len(trades)
+
+    def load_active_from_persistence(self) -> int:
+        """Load only ACTIVE/PENDING trades from persistence"""
+        with self._lock:
+            trades = self.persistence.get_active()
+            self._active_trades = {t.id: t for t in trades}
+            logger.info("TradeManager: Loaded %d active trades from persistence", len(trades))
+            return len(trades)
+
+    TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600}
+
+    def create_from_order(self, order_data: dict) -> ActiveTrade:
+        """Create ActiveTrade from order placement response"""
+        now = datetime.now(timezone.utc)
+        expires_at = now.timestamp() + 60  # Default M1 = 60 seconds
+        if "expiresAt" in order_data and order_data["expiresAt"]:
+            expires_at = datetime.fromisoformat(order_data["expiresAt"].replace("Z", "+00:00")).timestamp()
+        elif "duration" in order_data:
+            dur = order_data["duration"]
+            if isinstance(dur, (int, float)):
+                expires_at = now.timestamp() + dur
+            elif isinstance(dur, str):
+                expires_at = now.timestamp() + self.TIMEFRAME_SECONDS.get(dur.upper(), 60)
+
+        trade = ActiveTrade(
+            id=str(order_data.get("id", order_data.get("tradeId", ""))),
+            symbol=order_data.get("symbol", order_data.get("asset", "")),
+            direction=order_data.get("direction", ""),
+            amount=float(order_data.get("amount", 0)),
+            entry_price=float(order_data.get("entryPrice", order_data.get("entry_price", 0))),
+            payout=float(order_data.get("payout", 0)),
+            status="ACTIVE",
+            profit=0.0,
+            opened_at=now.isoformat().replace("+00:00", "Z"),
+            expires_at=datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z"),
+            closed_at="",
+            exit_price=0.0,
+            wallet=order_data.get("wallet", "REAL"),
+            timeframe=order_data.get("timeframe", "M1"),
+            verify_token=order_data.get("verify", ""),
+            created_at=now.isoformat().replace("+00:00", "Z"),
+            updated_at=now.isoformat().replace("+00:00", "Z"),
+        )
+        with self._lock:
+            self._active_trades[trade.id] = trade
+            self.persistence.save(trade)
+            logger.info("TradeManager: Created trade %s %s %s", trade.id, trade.symbol, trade.direction)
+            self._notify(trade)
+        return trade
+
+    def update_from_result(self, trade_result: dict) -> Optional[ActiveTrade]:
+        """Update trade from tradeResult event.
+        
+        Handles both structures:
+          A) {"trade": {...}, "result": "WON"}   (Socket.IO unwraps tradeResult)
+          B) {"tradeResult": {"trade": {...}}}    (raw nesting preserved)
+        
+        Redundant validation: checks both trade.status AND result field.
+        Saves ALL fields from the Puma payload.
+        """
+        trade_data = trade_result.get("trade") or trade_result.get("tradeResult", {}).get("trade", {})
+        trade_id = str(trade_data.get("id", trade_result.get("id", "")))
+        if not trade_id:
+            return None
+
+        # ── Redundant validation: trade.status + result ──
+        trade_status = str(trade_data.get("status", "")).upper()
+        result = str(trade_result.get("result", "")).upper()
+        
+        if trade_status == "WON" or result == "WON":
+            final_status = "WIN"
+        elif trade_status == "LOST" or result == "LOST":
+            final_status = "LOSS"
+        elif trade_status == "DRAW" or result == "DRAW":
+            final_status = "DRAW"
+        else:
+            final_status = trade_status or "ACTIVE"
+
+        profit = float(trade_data.get("profit", trade_result.get("profit", 0)))
+        new_balance = float(trade_result.get("newBalance", 0))
+
+        with self._lock:
+            trade = self._active_trades.get(trade_id)
+            if not trade:
+                trade = ActiveTrade(
+                    id=trade_id,
+                    uid=str(trade_data.get("uid", "")),
+                    user_id=str(trade_data.get("userId", trade_data.get("user_id", ""))),
+                    symbol=trade_data.get("symbol", trade_data.get("currency", "")),
+                    direction=trade_data.get("direction", ""),
+                    amount=float(trade_data.get("amount", 0)),
+                    entry_price=float(trade_data.get("entryPrice", trade_data.get("entry_price", 0))),
+                    payout=float(trade_data.get("payout", 0)),
+                    status=final_status,
+                    profit=profit,
+                    opened_at=trade_data.get("openedAt", ""),
+                    expires_at=trade_data.get("expiresAt", ""),
+                    closed_at=trade_data.get("closedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
+                    exit_price=float(trade_data.get("exitPrice", trade_data.get("exit_price", 0))),
+                    wallet=trade_data.get("wallet", "REAL"),
+                    timeframe=trade_data.get("timeframe", "M1"),
+                    result=result,
+                    new_balance=new_balance,
+                    trade_mode=str(trade_data.get("tradeMode", "")),
+                    duration=int(trade_data.get("duration", 0)),
+                )
+                self._active_trades[trade.id] = trade
+            else:
+                trade.status = final_status
+                trade.profit = profit
+                trade.result = result
+                trade.new_balance = new_balance
+                trade.closed_at = trade_data.get("closedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+                trade.exit_price = float(trade_data.get("exitPrice", trade_data.get("exit_price", trade.exit_price)))
+                trade.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            self.persistence.save(trade)
+            logger.info("TradeManager: Trade %s finalized — status=%s result=%s profit=%.2f newBalance=%.2f",
+                        trade.id, final_status, result, profit, new_balance)
+            self._notify(trade)
+
+            if trade.is_final():
+                logger.info("TradeManager: Trade %s finalized as %s", trade.id, final_status)
+
+            return trade
+
+    def update_from_poll(self, api_trade: dict) -> Optional[ActiveTrade]:
+        """Update trade from REST API poll (GET /trades or /trades/{id})"""
+        trade_id = str(api_trade.get("id", ""))
+        if not trade_id:
+            return None
+
+        status = api_trade.get("status", "ACTIVE").upper()
+        result = api_trade.get("result", "").upper()
+        profit = float(api_trade.get("profit", 0))
+
+        if result in ("WON", "WIN"):
+            status = "WIN"
+        elif result in ("LOST", "LOSS"):
+            status = "LOSS"
+        elif result == "DRAW":
+            status = "DRAW"
+
+        with self._lock:
+            trade = self._active_trades.get(trade_id)
+            if not trade:
+                trade = ActiveTrade(
+                    id=trade_id,
+                    symbol=api_trade.get("symbol", api_trade.get("asset", "")),
+                    direction=api_trade.get("direction", ""),
+                    amount=float(api_trade.get("amount", 0)),
+                    entry_price=float(api_trade.get("entryPrice", api_trade.get("entry_price", 0))),
+                    payout=float(api_trade.get("payout", 0)),
+                    status=status,
+                    profit=profit,
+                    opened_at=api_trade.get("openedAt", ""),
+                    expires_at=api_trade.get("expiresAt", ""),
+                    wallet=api_trade.get("wallet", "REAL"),
+                    timeframe=api_trade.get("timeframe", "M1"),
+                )
+                self._active_trades[trade.id] = trade
+            else:
+                trade.status = status
+                trade.profit = profit
+                if status in ("WIN", "LOSS", "DRAW"):
+                    trade.closed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    trade.exit_price = float(api_trade.get("exitPrice", api_trade.get("exit_price", trade.exit_price)))
+                trade.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            self.persistence.save(trade)
+            self._notify(trade)
+            return trade
+
+    def get(self, trade_id: str) -> Optional[ActiveTrade]:
+        with self._lock:
+            return self._active_trades.get(trade_id)
+
+    def get_all(self) -> List[ActiveTrade]:
+        with self._lock:
+            return list(self._active_trades.values())
+
+    def get_active(self) -> List[ActiveTrade]:
+        with self._lock:
+            return [t for t in self._active_trades.values() if t.is_active()]
+
+    def get_expired_active(self, grace_seconds: int = 15) -> List[ActiveTrade]:
+        with self._lock:
+            return [t for t in self._active_trades.values() if t.is_expired(grace_seconds)]
+
+    def remove(self, trade_id: str) -> bool:
+        with self._lock:
+            if trade_id in self._active_trades:
+                del self._active_trades[trade_id]
+                self.persistence.delete(trade_id)
+                logger.info("TradeManager: Removed trade %s", trade_id)
+                return True
+            return False
+
+
+class RecoveryManager:
+    """
+    Trade recovery via persistence + WebSocket tradeResult events only.
+    Does NOT call REST API endpoints (they return 404 on Puma).
+    """
+
+    EXPIRY_GRACE_SECONDS = 15
+    CHECK_INTERVAL = 10
+
+    def __init__(
+        self,
+        trade_manager: TradeManager,
+        api_client: Any,
+        socket_manager: Any = None,
+        persistence: PersistenceManager = None
+    ):
+        self.trade_manager = trade_manager
+        self.api_client = api_client
+        self.socket_manager = socket_manager
+        self.persistence = persistence or trade_manager.persistence
+        self._lock = threading.RLock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._last_check = 0
+        self._socket_connected = False
+
+    def start(self):
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run_loop, daemon=True, name="RecoveryManager")
+            self._thread.start()
+            logger.info("RecoveryManager: Started (persistence-only mode)")
+
+    def stop(self):
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
+            self._stop_event.set()
+            if self._thread:
+                self._thread.join(timeout=5)
+            logger.info("RecoveryManager: Stopped")
+
+    def on_socket_connect(self):
+        with self._lock:
+            logger.info("RecoveryManager: Socket connected")
+            self._socket_connected = True
+
+    def on_socket_disconnect(self):
+        with self._lock:
+            self._socket_connected = False
+
+    def _run_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                now = time.time()
+                if now - self._last_check >= self.CHECK_INTERVAL:
+                    self._check_expired_trades()
+                    self._check_socket_health()
+                    self._last_check = now
+            except Exception as e:
+                logger.error("RecoveryManager loop error: %s", e)
+            for _ in range(self.CHECK_INTERVAL):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    def _check_expired_trades(self):
+        """State machine for expired trades:
+        1. ACTIVE -> WAITING_RESULT (when expires_at is reached + small grace)
+        2. WAITING_RESULT -> ORPHAN (when 5 minutes pass without result)
+        """
+        all_trades = self.trade_manager.get_all()
+        now_utc = datetime.now(timezone.utc)
+        
+        for trade in all_trades:
+            if trade.status in ("WIN", "LOSS", "DRAW", "ORPHAN", "CANCELLED", "MISSING_RESULT", "DELAYED_RESULT"):
+                continue
+                
+            if not trade.expires_at:
+                continue
+                
+            try:
+                exp_time = datetime.fromisoformat(trade.expires_at.replace("Z", "+00:00"))
+                seconds_since_expiry = (now_utc - exp_time).total_seconds()
+            except Exception:
+                continue
+                
+            if trade.status in ("ACTIVE", "PENDING"):
+                if seconds_since_expiry > self.EXPIRY_GRACE_SECONDS:
+                    logger.info("RecoveryManager: Trade %s expired (%s). Transitioning to WAITING_RESULT", trade.id, trade.expires_at)
+                    trade.status = "WAITING_RESULT"
+                    trade.updated_at = now_utc.isoformat().replace("+00:00", "Z")
+                    self.trade_manager.persistence.save(trade)
+                    
+            elif trade.status == "WAITING_RESULT":
+                if seconds_since_expiry > 300:
+                    logger.warning("RecoveryManager: Trade %s WAITING_RESULT for > 5m. Transitioning to ORPHAN", trade.id)
+                    trade.status = "ORPHAN"
+                    trade.closed_at = now_utc.isoformat().replace("+00:00", "Z")
+                    trade.updated_at = trade.closed_at
+                    self.trade_manager.persistence.save(trade)
+
+    def _check_socket_health(self):
+        if self.socket_manager:
+            try:
+                is_connected = getattr(self.socket_manager, 'trades_connected', False)
+                if is_connected and not self._socket_connected:
+                    self.on_socket_connect()
+                elif not is_connected and self._socket_connected:
+                    self.on_socket_disconnect()
+            except Exception:
+                pass
+
+    def force_reconcile(self):
+        logger.info("RecoveryManager: Force check triggered")
+        self._check_expired_trades()
+
+    def get_status(self) -> dict:
+        with self._lock:
+            active = self.trade_manager.get_active()
+            expired = self.trade_manager.get_expired_active(self.EXPIRY_GRACE_SECONDS)
+            return {
+                "running": self._running,
+                "socket_connected": self._socket_connected,
+                "active_trades": len(active),
+                "expired_trades": len(expired),
+                "total_persisted": self.persistence.count_active(),
+            }
+
+
+class APIClient:
+    """Wrapper for API calls with consistent error handling"""
+
+    def __init__(self, base_url: str, auth_token: str = ""):
+        self.base_url = base_url.rstrip("/")
+        self.auth_token = auth_token
+        self._session = None
+
+    def _get_headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.auth_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _request(self, method: str, path: str, **kwargs) -> Optional[dict]:
+        import requests
+        from pumabroker.auth import AuthError
+        url = f"{self.base_url}{path}"
+        headers = self._get_headers()
+        auth_preview = headers.get("Authorization", "MISSING")[:30] + "..."
+        logger.info("%s %s | Authorization: %s", method, path, auth_preview)
+        try:
+            resp = requests.request(method, url, headers=headers, timeout=10, **kwargs)
+            logger.info("%s %s | Status HTTP: %d", method, path, resp.status_code)
+            if resp.status_code != 200:
+                logger.warning("%s %s | Non-200 response: %s", method, path, resp.text[:500])
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 401:
+                raise AuthError("Token expired or invalid (401)", status_code=401, response_body=resp.text)
+            elif resp.status_code == 403:
+                raise AuthError("Access forbidden (403)", status_code=403, response_body=resp.text)
+            elif resp.status_code == 404:
+                return None
+            else:
+                logger.error("API %s %s failed: %d %s", method, path, resp.status_code, resp.text)
+                return None
+        except AuthError:
+            raise
+        except Exception as e:
+            logger.error("API %s %s error: %s", method, path, e)
+            return None
+
+    def get_trades(self, limit: int = 50) -> List[dict]:
+        data = self._request("GET", f"/api/v1/trades?limit={limit}")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "trades" in data:
+            return data["trades"]
+        return []
+
+    def get_trade(self, trade_id: str) -> Optional[dict]:
+        return self._request("GET", f"/api/v1/trades/{trade_id}")
+
+    def place_trade(self, body: dict) -> dict:
+        result = self._request("POST", "/api/v1/trades", json=body)
+        return result or {}
+
+    def set_auth(self, token: str):
+        self.auth_token = token
+
+
+# ============================================================
+# END RECOVERY MANAGER CLASSES
+# ============================================================
 
 load_dotenv()
 
@@ -59,6 +1022,198 @@ class PumaDaemon:
     _relogin_lock = threading.Lock()
     _relogging_in: bool = False
 
+    # ─────────────────────────────────────────────────────────────────
+    # WebSocket listener para tradeUpdate em tempo real (WS3 /trades)
+    # ─────────────────────────────────────────────────────────────────
+    class _TradeWSListener:
+        """Escuta eventos tradeUpdate via Socket.IO e atualiza _trade_history instantaneamente."""
+
+        def __init__(self, daemon_ref: "PumaDaemon"):
+            self._daemon = daemon_ref
+            self._sio: socketio.AsyncClient | None = None
+            self._thread: threading.Thread | None = None
+            self._loop: asyncio.AbstractEventLoop | None = None
+            self._running = False
+            self._connected = False
+
+        @property
+        def trades_connected(self) -> bool:
+            return self._connected
+
+        def start(self, jwt_token: str, user_id: str) -> None:
+            if self._running:
+                return
+            self._running = True
+            self._thread = threading.Thread(target=self._run_loop, args=(jwt_token, user_id), daemon=True)
+            self._thread.start()
+            logger.info("Trade WS listener iniciado (thread background)")
+
+        def stop(self) -> None:
+            self._running = False
+            if self._sio and self._sio.connected and self._loop:
+                asyncio.run_coroutine_threadsafe(self._sio.disconnect(), self._loop)
+            if self._thread:
+                self._thread.join(timeout=3)
+
+        def _run_loop(self, jwt_token: str, user_id: str) -> None:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_until_complete(self._connect_and_listen(jwt_token, user_id))
+
+        async def _connect_and_listen(self, jwt_token: str, user_id: str) -> None:
+            self._sio = socketio.AsyncClient(
+                logger=False,
+                engineio_logger=False,
+                reconnection=True,
+                reconnection_attempts=10,
+                reconnection_delay=2,
+                reconnection_delay_max=30,
+            )
+
+            @self._sio.on("connect", namespace="/trades")
+            async def connect():
+                self._connected = True
+                logger.info("Trade WS conectado — subscrevendo account_id=%s", user_id)
+                await self._sio.emit("subscribe", user_id, namespace="/trades")
+                if self._daemon.recovery_manager:
+                    self._daemon.recovery_manager.on_socket_connect()
+
+            @self._sio.on("tradeUpdate", namespace="/trades")
+            async def on_trade_update(*args):
+                self._handle_trade_update(args[0] if args else {})
+
+            @self._sio.on("tradeResult", namespace="/trades")
+            async def on_trade_result(*args):
+                self._handle_trade_result(args[0] if args else {})
+
+            @self._sio.on("disconnect", namespace="/trades")
+            async def disconnect():
+                self._connected = False
+                logger.warning("Trade WS desconectado")
+                if self._daemon.recovery_manager:
+                    self._daemon.recovery_manager.on_socket_disconnect()
+
+            try:
+                await self._sio.connect(
+                    config.BASE_URL,
+                    socketio_path="/socket.io/",
+                    transports=["websocket"],
+                    headers={"Authorization": f"Bearer {jwt_token}"},
+                    namespaces=["/trades"],
+                )
+                await self._sio.wait()
+            except Exception as e:
+                logger.error("Trade WS erro: %s", e)
+            finally:
+                self._connected = False
+
+        def _handle_trade_update(self, data: dict) -> None:
+            try:
+                trade_id = str(data.get("id", ""))
+                if not trade_id:
+                    return
+                status = data.get("status", "ACTIVE")
+                profit = float(data.get("profit", 0))
+                result = status.lower() if status != "ACTIVE" else "pending"
+
+                # ── RECOVERY: Atualiza TradeManager para persistir status em tempo real ──
+                trade = self._daemon.trade_manager.update_from_poll(data)
+                if trade:
+                    logger.info("Recovery: tradeUpdate processado via TradeManager: id=%s status=%s profit=%.2f", trade.id, trade.status, trade.profit)
+
+                # Atualiza entrada existente no histórico
+                for entry in self._daemon._trade_history:
+                    if entry.get("id") == trade_id:
+                        entry["status"] = status
+                        entry["result"] = result
+                        entry["profit"] = profit
+                        entry["exitPrice"] = data.get("exitPrice")
+                        logger.info("WS tradeUpdate: id=%s status=%s profit=%.2f", trade_id, status, profit)
+                        return
+
+                # Trade novo (ex: copy trade) — adiciona ao histórico
+                self._daemon._trade_history.insert(0, {
+                    "id": trade_id,
+                    "asset": data.get("symbol"),
+                    "direction": data.get("direction"),
+                    "amount": data.get("amount"),
+                    "entryPrice": data.get("entryPrice"),
+                    "payout": data.get("payout"),
+                    "status": status,
+                    "profit": profit,
+                    "result": result,
+                    "openedAt": data.get("createdAt", time.time()),
+                })
+                if len(self._daemon._trade_history) > 200:
+                    self._daemon._trade_history = self._daemon._trade_history[:200]
+
+            except Exception as e:
+                logger.error("Erro processando tradeUpdate: %s", e)
+
+        def _handle_trade_result(self, data: dict) -> None:
+            try:
+                trade_data = data.get("trade") or data.get("tradeResult", {}).get("trade", {})
+                trade_id = str(trade_data.get("id", "") or data.get("id", "") or data.get("tradeId", ""))
+                if not trade_id:
+                    return
+
+                # ── Redundant validation: trade.status + result ──
+                trade_status = str(trade_data.get("status", "")).upper()
+                result = str(data.get("result", "")).upper()
+                
+                if trade_status == "WON" or result == "WON":
+                    final_status = "WIN"
+                elif trade_status == "LOST" or result == "LOST":
+                    final_status = "LOSS"
+                elif trade_status == "DRAW" or result == "DRAW":
+                    final_status = "DRAW"
+                else:
+                    final_status = trade_status or "ACTIVE"
+
+                profit = float(trade_data.get("profit", 0) or data.get("profit", 0) or data.get("pnl", 0))
+                new_balance = float(data.get("newBalance", 0))
+
+                logger.info("WS tradeResult: id=%s trade.status=%s result=%s → final=%s profit=%.2f newBalance=%.2f",
+                            trade_id, trade_status, result, final_status, profit, new_balance)
+                
+                # ── RECOVERY: Usa TradeManager para persistir e sincronizar ──
+                trade = self._daemon.trade_manager.update_from_result(data)
+                if trade:
+                    logger.info("Recovery: tradeResult processado via TradeManager: id=%s status=%s profit=%.2f", trade.id, trade.status, trade.profit)
+                
+                # Mantém _trade_history para compatibilidade com GET /trades
+                for entry in self._daemon._trade_history:
+                    if entry.get("id") == trade_id:
+                        entry["status"] = final_status
+                        entry["result"] = result.lower()
+                        entry["profit"] = profit
+                        entry["newBalance"] = new_balance
+                        entry["exitPrice"] = trade_data.get("exitPrice", entry.get("exitPrice"))
+                        entry["closedAt"] = trade_data.get("closedAt", entry.get("closedAt"))
+                        logger.info("WS tradeResult (legacy): id=%s status=%s profit=%.2f", trade_id, final_status, profit)
+                        return
+
+                # Trade novo (ex: copy trade) — adiciona ao histórico
+                self._daemon._trade_history.insert(0, {
+                    "id": trade_id,
+                    "asset": trade_data.get("symbol", trade_data.get("currency", "")),
+                    "direction": trade_data.get("direction", ""),
+                    "amount": trade_data.get("amount", 0),
+                    "entryPrice": trade_data.get("entryPrice", 0),
+                    "payout": trade_data.get("payout", 0),
+                    "status": final_status,
+                    "profit": profit,
+                    "result": result.lower(),
+                    "newBalance": new_balance,
+                    "openedAt": trade_data.get("openedAt", time.time()),
+                    "closedAt": trade_data.get("closedAt", time.time()),
+                })
+                if len(self._daemon._trade_history) > 200:
+                    self._daemon._trade_history = self._daemon._trade_history[:200]
+
+            except Exception as e:
+                logger.error("Erro processando tradeResult: %s", e)
+
     @classmethod
     def push_log(cls, entry: dict):
         cls._log_buffer.append(entry)
@@ -77,10 +1232,19 @@ class PumaDaemon:
         self._trades_api: TradesAPI | None = None
         self._user_id: str | None = None
         self._copy_enabled = False
-        self._copy_user_confirmed = False  # só permite copy se usuário confirmar via toggle explícito
+        self._copy_user_confirmed = False
         self._copy_sessions: list[dict] = []
         self._recent_orders: deque[dict] = deque(maxlen=50)
+        self._trade_history: list[dict] = []
+        self._trade_ws = self._TradeWSListener(self)
         self._load_sessions()
+        self._token_manager = None
+
+        # ── RECOVERY MANAGER ──────────────────────────────────────
+        self.persistence = PersistenceManager()
+        self.trade_manager = TradeManager(self.persistence, self)
+        self.recovery_manager = RecoveryManager(self.trade_manager, self, self._trade_ws, self.persistence)
+        self.api_client = self
 
     def _save_sessions(self):
         data = {
@@ -295,9 +1459,12 @@ class PumaDaemon:
         return self._copy_enabled
 
     def login(self, email: str, password: str) -> dict:
-        self._auth = PumaBrokerAuth(email, password)
+        # Use TokenManager for persistent token management
+        self._token_manager = get_token_manager(email, password)
+        self._auth = self._token_manager.auth  # Get synchronized PumaBrokerAuth
+        
         try:
-            session = self._auth.login()
+            session = self._auth.get_session()
         except AuthError as e:
             logger.error("Falha no login para %s: status=%d, erro=%s", email, e.status_code, e)
             raise
@@ -309,8 +1476,10 @@ class PumaDaemon:
             wallet="DEMO" if session.is_demo else "REAL",
         )
 
-        # Extrai o accessToken JWT como token WS2
-        ws2_token = self._auth.ws2_token
+        # Extrai o server_name_session (WS2) — lê do TokenManager compartilhado
+        # (singleton), pois o cookie pode ter sido capturado em outra instância
+        # PumaBrokerAuth durante refresh/login.
+        ws2_token = self._token_manager.ws2_token or self._auth.ws2_token
 
         if ws2_token:
             ws2_preview = ws2_token[:20] + "..." if len(ws2_token) > 20 else ws2_token
@@ -323,6 +1492,15 @@ class PumaDaemon:
             "SIM" if ws2_token else "NÃO",
             ws2_preview,
         )
+
+        # Inicializa Recovery Manager (carrega trades persistidos + inicia monitoramento)
+        self.trade_manager.api_client = self  # self atua como API client
+        self.trade_manager.load_active_from_persistence()
+        self.recovery_manager.api_client = self
+        self.recovery_manager.start()
+
+        # Inicia listener WebSocket de trades em background (atualiza _trade_history em tempo real)
+        self._trade_ws.start(session.token, session.user_id)
 
         return {
             "user": {
@@ -339,20 +1517,25 @@ class PumaDaemon:
                 "verified": True,
                 "country": session.country,
             },
-            "token": session.token,
+"token": session.token,
             "ws2Session": ws2_token,
         }
 
     def _ensure_auth(self):
-        if not self._auth:
+        if not self._token_manager:
             raise AuthError("Não autenticado. Faça login primeiro.")
 
     def _ensure_token(self):
         self._ensure_auth()
-        fresh = self._auth.ensure_token()
+        fresh = self._token_manager.get_access_token()
         if self._trades_api and fresh != self._trades_api._jwt:
             self._trades_api.update_jwt(fresh)
         return fresh
+
+    def _get_auth(self) -> PumaBrokerAuth:
+        """Retorna a instância sincronizada do PumaBrokerAuth."""
+        self._ensure_auth()
+        return self._token_manager.auth
 
     def get_balance(self) -> dict:
         self._ensure_auth()
@@ -361,10 +1544,11 @@ class PumaDaemon:
             raise AuthError("user_id não disponível. Faça login novamente.")
         # /api/v1/users/me retorna 403; o endpoint correto é /api/v1/users/{user_id}
         url = f"{config.BASE_URL}/api/v1/users/{self._user_id}"
-        r = self._auth.http.get(url, timeout=config.HTTP_TIMEOUT)
+        auth = self._token_manager.auth
+        r = auth.http.get(url, timeout=config.HTTP_TIMEOUT)
         if r.status_code == 401:
-            self._auth.login()
-            r = self._auth.http.get(url, timeout=config.HTTP_TIMEOUT)
+            self._token_manager.force_refresh()
+            r = auth.http.get(url, timeout=config.HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         return {
@@ -375,10 +1559,11 @@ class PumaDaemon:
     def get_active(self) -> list:
         self._ensure_auth()
         self._ensure_token()
-        r = self._auth.http.get(config.ACTIVE_URL, timeout=config.HTTP_TIMEOUT)
+        auth = self._token_manager.auth
+        r = auth.http.get(config.ACTIVE_URL, timeout=config.HTTP_TIMEOUT)
         if r.status_code == 401:
-            self._auth.login()
-            r = self._auth.http.get(config.ACTIVE_URL, timeout=config.HTTP_TIMEOUT)
+            self._token_manager.force_refresh()
+            r = auth.http.get(config.ACTIVE_URL, timeout=config.HTTP_TIMEOUT)
         r.raise_for_status()
         return r.json()
 
@@ -431,8 +1616,8 @@ class PumaDaemon:
             if e.status_code != 401:
                 raise
             logger.warning("JWT expirado — renovando e retentando ordem...")
-            self._auth.login()
-            fresh = self._auth.ensure_token()
+            self._token_manager.force_refresh()
+            fresh = self._token_manager.get_access_token()
             self._trades_api.update_jwt(fresh)
             _t_retry = time.perf_counter()
             result = self._trades_api.place_order(
@@ -447,17 +1632,36 @@ class PumaDaemon:
             _t2 = time.perf_counter()
             logger.info(f"[LATENCY] place_trade RETRY: puma_api={round((_t2 - _t_retry) * 1000)}ms total={round((_t2 - _t0) * 1000)}ms")
 
+        # ── ARMAZENA NO HISTÓRICO (para GET /trades list) ──
+        self._trade_history.append({
+            "id": result.get("id"),
+            "asset": body.get("asset"),
+            "direction": body.get("direction"),
+            "amount": body.get("amount"),
+            "entryPrice": body.get("entryPrice", 0),
+            "payout": payout,
+            "status": result.get("status", "ACTIVE"),
+            "profit": result.get("profit", 0),
+            "result": result.get("result", "pending"),
+            "openedAt": result.get("openedAt", result.get("createdAt", time.time())),
+        })
+        self._trade_history = self._trade_history[-200:]  # mantém só os 200 mais recentes
+
+        # ── RECOVERY: Persiste trade ativa no TradeManager ──
+        trade = self.trade_manager.create_from_order(result)
+        logger.info("TradeManager: Nova trade %s criada e persistida", trade.id)
+
         # ── COPY TRADER: dispara em threads separadas (não bloqueia a trade principal) ──
         # PROTECAO: só executa se usuario confirmou explicitamente via toggle + flag ativa
         # A flag _copy_user_confirmed NUNCA persiste no arquivo, entao mesmo que o arquivo
         # .copy_sessions.json tenha "enabled": true, a copia nao roda apos restart.
+        n_copies = 0
         if self._copy_enabled and not self._copy_user_confirmed:
             logger.warning(
                 "COPY TRADE BLOQUEADO: _copy_enabled=True mas _copy_user_confirmed=False. "
                 "Usuario precisa ativar copy via toggle explicito na interface."
             )
         if self._copy_enabled and self._copy_user_confirmed:
-            n_copies = 0
             for acc in self._copy_sessions:
                 if not acc["active"]:
                     continue
@@ -476,8 +1680,28 @@ class PumaDaemon:
                     daemon=True,
                 )
                 t.start()
-            if n_copies > 0:
-                logger.info(f"[LATENCY] copy_trades: {n_copies} conta(s) dispatchadas em threads paralelas")
+
+        if n_copies > 0:
+            logger.info(f"[LATENCY] copy_trades: {n_copies} conta(s) dispatchadas em threads paralelas")
+
+        # Armazena a trade no histórico do servidor (mantém últimos 200)
+        trade_entry = {
+            "id": result.get("id", ""),
+            "asset": body.get("asset", ""),
+            "direction": body.get("direction", ""),
+            "amount": body.get("amount", 0),
+            "entryPrice": body.get("entryPrice", 0),
+            "payout": payout,
+            "status": result.get("status", "ACTIVE"),
+            "profit": 0,  # será atualizado quando houver resultado final via WebSocket
+            "result": "PENDING",
+            "openedAt": int(time.time() * 1000),
+        }
+        self._trade_history.insert(0, trade_entry)
+        if len(self._trade_history) > 200:
+            self._trade_history = self._trade_history[:200]
+
+        return result
 
         return result
 
@@ -503,44 +1727,63 @@ class PumaDaemon:
             acc["last_error"] = str(e)[:200]
             logger.warning("Copy trade FAIL: %s — %s", acc["label"], str(e)[:200])
 
+    def list_trades(self, limit: int = 50) -> list[dict]:
+        """Retorna histórico de trades usando APENAS o TradeManager (persistido em SQLite).
+        
+        Trades são resolvidos exclusivamente via eventos WebSocket tradeResult.
+        Não faz chamadas REST para status de trades (endpoints /api/v1/trades e
+        /api/v1/trades/{id} retornam 404 na API da Puma).
+        """
+        trades = self.trade_manager.get_all()[:limit]
+        return [self._trade_to_dict(t) for t in trades]
+
+    def _trade_to_dict(self, trade: ActiveTrade) -> dict:
+        """Converte ActiveTrade para dict compatível com GET /trades"""
+        return {
+            "id": trade.id,
+            "asset": trade.symbol,
+            "direction": trade.direction,
+            "amount": trade.amount,
+            "entryPrice": trade.entry_price,
+            "payout": trade.payout,
+            "status": trade.status,
+            "profit": trade.profit,
+            "result": trade.result or trade.status.lower() if trade.status in ("WIN", "LOSS", "DRAW") else "pending",
+            "newBalance": trade.new_balance,
+            "openedAt": trade.opened_at,
+            "expiresAt": trade.expires_at,
+            "closedAt": trade.closed_at,
+            "exitPrice": trade.exit_price,
+        }
+
+    def get_trades(self, limit: int = 50) -> list[dict]:
+        """Wrapper para APIClient - usado pelo RecoveryManager"""
+        return self.list_trades(limit)
+
     def get_trade(self, order_id: str) -> dict:
-        self._ensure_auth()
-        self._ensure_token()
+        """Retorna trade do TradeManager (persistido em SQLite).
+        Trades são resolvidos via WebSocket tradeResult, não via REST API."""
+        trade = self.trade_manager.get(order_id)
+        if trade:
+            return self._trade_to_dict(trade)
+        return None
 
-        target_url = f"{config.TRADES_URL}/{order_id}"
+    def place_trade_for_recovery(self, body: dict) -> dict:
+        """Wrapper para APIClient - usado pelo RecoveryManager"""
+        return self.place_trade(body)
 
-        r = self._auth.http.get(
-            target_url,
-            timeout=config.HTTP_TIMEOUT,
-        )
-        if r.status_code == 401:
-            logger.warning("JWT expirado em get_trade — renovando e retentando...")
-            self._auth.login()
-            r = self._auth.http.get(
-                target_url,
-                timeout=config.HTTP_TIMEOUT,
-            )
+    def set_auth(self, token: str):
+        """Define token de autenticação para APIClient"""
+        pass  # O daemon gerencia auth internamente
 
-        if not r.ok:
-            raise OrderError(
-                f"Erro ao buscar trade {order_id}: HTTP {r.status_code} — {r.text[:500]}",
-                status_code=r.status_code,
-            )
-        try:
-            order = r.json()
-        except ValueError as e:
-            raise OrderError(
-                f"Resposta inválida (não-JSON) ao buscar trade {order_id}: {e}",
-            )
-
-        logger.info(
-            "GET_TRADE: id=%s status=%s profit=%s",
-            order.get("id"),
-            order.get("status"),
-            order.get("profit"),
-        )
-
-        return order
+    def subscribe_trades(self):
+        """Re-subscreve no namespace /trades após reconexão"""
+        if self._trade_ws and self._trade_ws._sio and self._trade_ws._sio.connected:
+            try:
+                self._trade_ws._sio.emit("subscribe", self._user_id, namespace="/trades")
+                logger.info("Recovery: Re-subscrito no namespace /trades")
+            except Exception as e:
+                logger.error("Erro ao re-subscrever trades: %s", e)
 
     @staticmethod
     def _expiration_to_timeframe(seconds: int) -> str:
@@ -596,8 +1839,9 @@ class PumaDaemon:
         self._ensure_auth()
 
         # Diagnóstico detalhado do que disparou a necessidade de re-login
-        token_presente = bool(self._auth.ws2_token)
-        token_preview = (self._auth.ws2_token[:20] + "...") if token_presente else "VAZIO"
+        auth = self._get_auth()
+        token_presente = bool(auth.ws2_token)
+        token_preview = (auth.ws2_token[:20] + "...") if token_presente else "VAZIO"
         trigger = "force_refresh=True (frontend)" if force_refresh else "ws2_token ausente/expirado"
         timestamp_iso = datetime.now().isoformat(timespec='milliseconds')
 
@@ -606,7 +1850,7 @@ class PumaDaemon:
             timestamp_iso, force_refresh, token_presente, token_preview, trigger
         )
 
-        precisa_relogin = force_refresh or not self._auth.ws2_token
+        precisa_relogin = force_refresh or not auth.ws2_token
 
         # Circuit breaker: se excedeu tentativas, bloqueia auto-recuperação
         if precisa_relogin and PumaDaemon._relogin_failures >= PumaDaemon.MAX_RELOGIN_ATTEMPTS:
@@ -640,11 +1884,14 @@ class PumaDaemon:
                             logger.info("═══ WS2 RE-LOGIN INICIADO ═══ ts=%s | trigger=%s | tentativas_anteriores=%d/%d",
                                        timestamp_iso, trigger, PumaDaemon._relogin_failures, PumaDaemon.MAX_RELOGIN_ATTEMPTS)
                             login_start = time.perf_counter()
-                            self._auth.login()
+                            # Use TokenManager to force refresh
+                            self._token_manager.force_refresh()
                             self._ensure_token()
                             login_elapsed = round((time.perf_counter() - login_start) * 1000)
                             PumaDaemon._relogin_failures = 0  # reset no sucesso
-                            token_novo = self._auth.ws2_token
+                            # Refresh auth reference
+                            auth = self._get_auth()
+                            token_novo = auth.ws2_token
                             token_novo_preview = (token_novo[:20] + "...") if token_novo else "VAZIO"
                             logger.info("═══ WS2 RE-LOGIN SUCESSO ═══ duracao_ms=%d | novo_token=%s",
                                        login_elapsed, token_novo_preview)
@@ -666,7 +1913,7 @@ class PumaDaemon:
                         finally:
                             PumaDaemon._relogging_in = False
 
-        token = self._auth.ws2_token
+        token = auth.ws2_token
         if not token:
             PumaDaemon._relogin_failures += 1
             logger.error(
@@ -686,10 +1933,11 @@ class PumaDaemon:
         token = self._ensure_token()
         params = {"symbol": symbol, "resolution": resolution, "from": from_ts, "to": to_ts}
         url = f"{config.BASE_URL}/api/v1/tradingview/history"
-        r = self._auth.http.get(url, params=params, timeout=config.HTTP_TIMEOUT)
+        auth = self._token_manager.auth
+        r = auth.http.get(url, params=params, timeout=config.HTTP_TIMEOUT)
         if r.status_code == 401:
-            self._auth.login()
-            r = self._auth.http.get(url, params=params, timeout=config.HTTP_TIMEOUT)
+            self._token_manager.force_refresh()
+            r = auth.http.get(url, params=params, timeout=config.HTTP_TIMEOUT)
         r.raise_for_status()
         return r.json()
 
@@ -779,7 +2027,11 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = self._get_path()
         try:
-            if path.startswith("/copy/accounts/"):
+            if path == "/trades":
+                daemon._trade_history.clear()
+                logger.info("Trade history cleared via DELETE /trades")
+                self._send(200, {"success": True, "cleared": True})
+            elif path.startswith("/copy/accounts/"):
                 account_id = path.split("/")[-1]
                 ok = daemon.copy_remove_account(account_id)
                 if ok:
@@ -847,6 +2099,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send(200, {
                     "id": trade_id,
                     "status": result.get("status", "ACTIVE"),
+                    "expiresAt": result.get("expiresAt"),
                 })
 
             elif path == "/copy/accounts":
@@ -875,6 +2128,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                     PumaDaemon.push_log(body)
                 self._send(200, {"ok": True})
 
+            elif path == "/logs":
+                body = self._read_body()
+                if isinstance(body, list):
+                    for entry in body:
+                        PumaDaemon.push_log(entry)
+                elif isinstance(body, dict):
+                    PumaDaemon.push_log(body)
+                self._send(200, {"ok": True})
+
+            elif path == "/recovery/reconcile":
+                # Força reconciliação imediata
+                self._daemon.recovery_manager.force_reconcile()
+                self._send(200, {"status": "reconciliation_started"})
+
+            elif path == "/recovery/status":
+                # Status do recovery manager
+                status = self._daemon.recovery_manager.get_status()
+                self._send(200, status)
+
             else:
                 self._send(404, {"error": f"Rota não encontrada: POST {path}"})
 
@@ -899,6 +2171,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path == "/active":
                 result = daemon.get_active()
                 self._send(200, result)
+
+            elif path == "/trades":
+                result = daemon.list_trades(limit=50)
+                self._send(200, {"trades": result})
 
             elif path.startswith("/trades/"):
                 order_id = path.split("/")[-1]
@@ -951,6 +2227,27 @@ class RequestHandler(BaseHTTPRequestHandler):
                 level = query.get("level", [""])[0]
                 result = PumaDaemon.get_logs(limit=limit, level=level)
                 self._send(200, result)
+
+            # ── RECOVERY ENDPOINTS ─────────────────────────────────────
+            elif path == "/recovery/status":
+                result = daemon.recovery_manager.get_status()
+                self._send(200, result)
+
+            elif path == "/recovery/reconcile":
+                daemon.recovery_manager.force_reconcile()
+                self._send(200, {"status": "reconciliation_started"})
+
+            elif path == "/recovery/trades":
+                active = daemon.trade_manager.get_active()
+                self._send(200, {"trades": [t.to_dict() for t in active]})
+
+            elif path == "/recovery/persisted":
+                all_trades = daemon.persistence.get_all()
+                self._send(200, {"trades": [t.to_dict() for t in all_trades]})
+
+            elif path == "/recovery/clear":
+                count = daemon.persistence.clear_all()
+                self._send(200, {"cleared": count})
 
             else:
                 self._send(404, {"error": f"Rota não encontrada: GET {path}"})

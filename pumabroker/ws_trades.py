@@ -139,8 +139,6 @@ class TradesWebSocket:
             reconnection_attempts=config.WS_MAX_RECONNECT,
             reconnection_delay=config.WS_RECONNECT_DELAY,
             reconnection_delay_max=30,
-            ping_interval=25,       # Conforme descoberto: pingInterval=25000ms
-            ping_timeout=20,        # Conforme descoberto: pingTimeout=20000ms
         )
 
         # Registra handlers de eventos

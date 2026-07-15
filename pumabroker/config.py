@@ -38,6 +38,7 @@ class PumaBrokerConfig:
     ME_URL:       str = "https://trade.pumabroker.com/api/v1/users/me"
     ACTIVE_URL:   str = "https://trade.pumabroker.com/api/v1/currencies"
     TRADES_URL:   str = "https://trade.pumabroker.com/api/v1/trades"
+    TRADES_HISTORY_URL: str = "https://trade.pumabroker.com/api/v1/trades/history"
 
     # ── WebSocket 1 — Socket.IO — preços tick ─────────────────────────────────
     # Frames observados: 42["price",{...}], 42["candle",{...}], 42["serverTime",{...}]
@@ -62,6 +63,9 @@ class PumaBrokerConfig:
     SESSION_TOKEN: Optional[str] = field(
         default_factory=lambda: os.getenv("PUMA_SESSION")
     )
+
+    # ── Token Persistence ───────────────────────────────────────────────────────
+    TOKEN_FILE: str = "puma_tokens.json"
 
     # ── Socket.IO Engine.IO v4 ────────────────────────────────────────────────
     # Descoberto: pingInterval=25000, pingTimeout=20000

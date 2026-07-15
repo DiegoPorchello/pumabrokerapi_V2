@@ -12,13 +12,19 @@ auth.py — Autenticação automática para a Puma Broker (API v1).
 
   O cookie server_name_session (usado pelo WS2) NÃO vem na resposta de login.
   É obtido via uma requisição GET ao perfil do usuário logo após o login.
+
+  ATENÇÃO: Esta classe agora delega gerenciamento de tokens ao TokenManager.
+  Use TokenManager para obter tokens persistentes e renovação automática.
 """
 
 import logging
 import os
 import re
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .token_manager import TokenData
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -67,18 +73,19 @@ class PumaBrokerAuth:
     """
     Gerencia autenticacao automatica na Puma Broker.
 
-    Fluxo:
-      1. POST /login obtem JWT token + dados do usuario
-      2. JWT e usado no header Authorization: Bearer <token>
-      3. GET /api/v1/users/{id} para capturar server_name_session (WS2)
-      4. Refresh automatico quando token expira (erro 401 ou JWT exp)
+    Fluxo (delegado ao TokenManager):
+      1. TokenManager carrega tokens do arquivo JSON
+      2. TokenManager verifica expiração e renova via refreshToken se necessário
+      3. Se refreshToken falhar, faz login completo
+      4. Tokens são persistidos automaticamente em tokens.json
+      5. JWT é usado no header Authorization: Bearer <token>
+      6. GET /api/v1/users/{id} para capturar server_name_session (WS2)
 
     Uso:
         auth = PumaBrokerAuth("email@gmail.com", "senha")
-        session = auth.login()
-        print(session.token)    # JWT pronto para usar
-        print(session.user_id)  # "28318"
-        ws2 = auth.ws2_token    # server_name_session
+        token = auth.get_token()        # Obtém token válido (com renovação automática)
+        session = auth.ensure_session() # Garante sessão completa
+        ws2 = auth.ws2_token            # server_name_session
     """
 
     TOKEN_TTL = 23 * 3600
@@ -86,8 +93,11 @@ class PumaBrokerAuth:
     def __init__(self, email: str, password: str):
         self._email = email
         self._password = password
+        self._token_manager: "TokenManager"
         self._session: Optional[UserSession] = None
-        self._login_ts: float = 0.0
+        # Lazy import to avoid circular dependency
+        from .token_manager import TokenManager
+        self._token_manager = TokenManager(email, password)
         self._http = self._build_http()
         self._ws2_token_value: Optional[str] = None
 
@@ -140,23 +150,44 @@ class PumaBrokerAuth:
 
         return None
 
+    def _propagate_ws2_token(self, val: str) -> None:
+        """Propaga o server_name_session para o TokenManager compartilhado
+        (singleton), de onde o daemon e demais instâncias PumaBrokerAuth leem."""
+        try:
+            if getattr(self._token_manager, "ws2_token", "") != val:
+                self._token_manager.ws2_token = val
+        except Exception:
+            pass
+
     def _fetch_ws2_session(self) -> None:
         """Faz requisicao ao perfil do usuario para capturar server_name_session.
         O endpoint /api/v1/users/{id} e chamado logo apos login, e a Puma
         aproveita para setar o cookie server_name_session na resposta."""
-        if not self._session:
+        token_data = self._token_manager.get_token_data()
+        if not token_data or not token_data.user_id:
             self._ws2_token_value = None
             return
 
-        url = f"{config.BASE_URL}/api/v1/users/{self._session.user_id}"
+        url = f"{config.BASE_URL}/api/v1/users/{token_data.user_id}"
         try:
-            resp = self._http.get(url, timeout=config.HTTP_TIMEOUT)
+            # Usa token válido do TokenManager
+            access_token = self._token_manager.get_access_token()
+            headers = {"Authorization": f"Bearer {access_token}"}
+            resp = self._http.get(url, headers=headers, timeout=config.HTTP_TIMEOUT)
             val = self._extract_server_name_session(resp)
             if val:
                 self._ws2_token_value = val
+                self._propagate_ws2_token(val)
                 return
         except Exception as e:
             logger.warning("Falha ao buscar server_name_session: %s", e)
+
+        # Fallback: o cookie pode já estar no jar da sessão HTTP (setado por respostas anteriores)
+        jar_val = self._http.cookies.get("server_name_session")
+        if jar_val:
+            self._ws2_token_value = jar_val
+            self._propagate_ws2_token(jar_val)
+            return
 
         self._ws2_token_value = None
 
@@ -167,7 +198,7 @@ class PumaBrokerAuth:
         self._ws2_token_value = None
 
     def login(self) -> UserSession:
-        """Realiza login e retorna a sessao com JWT token (API v1).
+        """Realiza login completo e retorna a sessao com JWT token (API v1).
 
         Endpoint: POST https://trade.pumabroker.com/api/v1/auth/login
         Payload:  {"email": "...", "password": "..."}
@@ -176,7 +207,7 @@ class PumaBrokerAuth:
         Raises:
             AuthError: credenciais invalidas ou servidor fora
         """
-        logger.info("Fazendo login: %s", self._email)
+        logger.info("[TOKEN] Executando novo login para: %s", self._email)
 
         self._clear_ws2_token()
 
@@ -209,15 +240,19 @@ class PumaBrokerAuth:
         if "accessToken" not in data and "token" not in data:
             raise AuthError(f"Resposta inesperada do login: {data}")
 
-        self._session = UserSession(data)
-        self._login_ts = time.time()
+        session = UserSession(data)
 
-        self._http.headers["Authorization"] = f"Bearer {self._session.token}"
+        # Atualiza TokenManager com novos tokens
+        self._token_manager.update_from_login(session)
+
+        # Configura header Authorization na sessão HTTP
+        self._http.headers["Authorization"] = f"Bearer {session.token}"
 
         # Tenta capturar server_name_session da propria resposta de login
         val = self._extract_server_name_session(resp)
         if val:
             self._ws2_token_value = val
+            self._propagate_ws2_token(val)
         else:
             # Login nao retornou o cookie — faz requisicao extra ao perfil
             logger.info("server_name_session nao veio no login — buscando via GET /users/{id}...")
@@ -225,91 +260,138 @@ class PumaBrokerAuth:
 
         logger.info(
             "Login OK: %s (id=%s) balance=%.2f demo=%.2f ws2_token=%s",
-            self._session.name,
-            self._session.user_id,
-            self._session.balance,
-            self._session.demo_balance,
+            session.name,
+            session.user_id,
+            session.balance,
+            session.demo_balance,
             "SIM" if self._ws2_token_value else "NAO",
         )
-        return self._session
+        return session
 
-    def ensure_token(self) -> str:
-        """Garante que o token esta valido, fazendo refresh se necessario.
-
-        Usa refreshToken se disponivel (API v1) ou faz login novamente.
-
-        Returns:
-            JWT token valido
+    def ensure_session(self) -> UserSession:
         """
-        if self._session is None:
-            self.login()
-        elif time.time() - self._login_ts >= self.TOKEN_TTL:
-            if self._session.refresh_token:
-                self._refresh_token()
-            else:
-                logger.info("JWT expirado renovando...")
-                self.login()
-        return self._session.token
+        Garante sessão válida - faz login ou refresh conforme necessário.
+        Delega ao TokenManager que já gerencia persistência e renovação.
+        """
+        token_data = self._token_manager.get_token_data()
 
-    def _refresh_token(self) -> None:
-        """Renova o accessToken usando o refreshToken."""
-        logger.info("Renovando JWT via refreshToken...")
+        if token_data and token_data.is_valid():
+            logger.info("[TOKEN] AccessToken válido encontrado — user=%s", token_data.email)
+            # Cria sessão a partir dos tokens salvos
+            session = UserSession({
+                "accessToken": token_data.access_token,
+                "refreshToken": token_data.refresh_token,
+                "user": {
+                    "id": token_data.user_id,
+                    "email": token_data.email,
+                }
+            })
+            self._http.headers["Authorization"] = f"Bearer {token_data.access_token}"
+            return session
+
+        # Token expirado ou não existe - TokenManager fará refresh ou login
+        return self.get_session()
+
+    def get_session(self) -> UserSession:
+        """
+        Obtém sessão válida (faz login se necessário).
+        O TokenManager gerencia automaticamente refresh/login.
+        """
+        access_token = self._token_manager.get_access_token()
+        token_data = self._token_manager.get_token_data()
+
+        if token_data and token_data.refresh_token:
+            # Tenta refresh se temos refresh token
+            try:
+                return self._try_refresh_session(token_data)
+            except AuthError:
+                logger.warning("[TOKEN] Refresh falhou, fazendo login completo")
+                return self.login()
+
+        # Sem refresh token ou refresh falhou - login completo
+        return self.login()
+
+    def _try_refresh_session(self, token_data: "TokenData") -> UserSession:
+        """Tenta renovar sessão usando refresh token."""
+        logger.info("[TOKEN] Renovando JWT via refreshToken...")
+
         try:
             resp = self._http.post(
                 config.AUTH_REFRESH_URL,
-                json={"refreshToken": self._session.refresh_token},
+                json={"refreshToken": token_data.refresh_token},
                 timeout=config.HTTP_TIMEOUT,
             )
+            # O cookie server_name_session (válido por 24h) pode vir na resposta
+            # de refresh MESMO quando o refresh token em si é inválido (HTTP 201).
+            # Capturamos e propagamos independentemente do status da resposta.
+            refresh_ws2 = self._extract_server_name_session(resp)
+            if refresh_ws2:
+                self._ws2_token_value = refresh_ws2
+                self._propagate_ws2_token(refresh_ws2)
             if resp.status_code == 200:
                 data = resp.json()
                 new_token = data.get("accessToken", "")
                 new_refresh = data.get("refreshToken", "")
-                if new_token:
-                    self._session.token = new_token
-                    self._http.headers["Authorization"] = f"Bearer {new_token}"
-                if new_refresh:
-                    self._session.refresh_token = new_refresh
-                self._login_ts = time.time()
+                if not new_token:
+                    raise AuthError("Refresh response sem accessToken")
 
-                # Tenta capturar server_name_session da resposta do refresh
-                val = self._extract_server_name_session(resp)
-                if val:
-                    self._ws2_token_value = val
-                else:
-                    logger.info("server_name_session nao veio no refresh — buscando via GET /users/{id}...")
-                    self._fetch_ws2_session()
+                # Atualiza TokenManager
+                self._token_manager.update_from_refresh(data)
 
-                logger.info("JWT renovado com sucesso")
+                # Atualiza header HTTP
+                self._http.headers["Authorization"] = f"Bearer {new_token}"
+
+                # Tenta capturar server_name_session (caso ainda não tenha vindo)
+                if not refresh_ws2:
+                    val = self._extract_server_name_session(resp)
+                    if val:
+                        self._ws2_token_value = val
+                        self._propagate_ws2_token(val)
+                    else:
+                        self._fetch_ws2_session()
+
+                logger.info("[TOKEN] Novo AccessToken recebido e salvo")
+
+                return UserSession({
+                    "accessToken": new_token,
+                    "refreshToken": new_refresh,
+                    "user": {
+                        "id": token_data.user_id,
+                        "email": token_data.email,
+                    }
+                })
             else:
-                logger.warning("Refresh token invalido refazendo login")
-                self.login()
+                logger.warning("[TOKEN] RefreshToken inválido (HTTP %d)", resp.status_code)
+                raise AuthError("Refresh token inválido")
+        except AuthError:
+            raise
         except Exception as e:
-            logger.warning("Erro no refresh token: %s refazendo login", e)
-            self.login()
+            logger.warning("[TOKEN] Erro no refresh token: %s", e)
+            raise AuthError(f"Erro no refresh: {e}")
 
     def refresh(self) -> UserSession:
         """Forca renovacao do token (chamar apos erro 401)."""
-        logger.info("Refresh forcado do JWT...")
-        if self._session and self._session.refresh_token:
-            self._refresh_token()
-            return self._session
+        logger.info("[TOKEN] Refresh forcado do JWT...")
+        token_data = self._token_manager.get_token_data()
+        if token_data and token_data.refresh_token:
+            return self._try_refresh_session(token_data)
         return self.login()
 
-    @property
-    def session(self) -> Optional[UserSession]:
-        return self._session
+    def get_access_token(self) -> str:
+        """Obtém access token válido (renova automaticamente se expirado)."""
+        return self._token_manager.get_access_token()
 
     @property
     def token(self) -> str:
-        if not self._session:
-            raise AuthError("Nao autenticado. Chame login() primeiro.")
-        return self._session.token
+        """Retorna o token atual (compatibilidade)."""
+        return self._token_manager.get_access_token()
 
     @property
     def user_id(self) -> str:
-        if not self._session:
+        token_data = self._token_manager.get_token_data()
+        if not token_data:
             raise AuthError("Nao autenticado.")
-        return self._session.user_id
+        return token_data.user_id
 
     @property
     def http(self) -> requests.Session:
@@ -318,6 +400,17 @@ class PumaBrokerAuth:
 
     @property
     def ws2_token(self) -> Optional[str]:
-        """Retorna o server_name_session para o WS2.
-        Capturado de Set-Cookie da resposta do login ou de GET /users/{id}."""
+        """Retorna o server_name_session para o WS2."""
         return self._ws2_token_value
+
+    # Propriedades de compatibilidade
+    @property
+    def session(self) -> Optional[UserSession]:
+        token_data = self._token_manager.get_token_data()
+        if token_data:
+            return UserSession({
+                "accessToken": token_data.access_token,
+                "refreshToken": token_data.refresh_token,
+                "user": {"id": token_data.user_id, "email": token_data.email}
+            })
+        return None
