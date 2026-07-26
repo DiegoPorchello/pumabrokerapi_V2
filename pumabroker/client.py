@@ -322,7 +322,7 @@ class PumaBroker:
             raise RuntimeError("Não conectado. Chame await connect() primeiro.")
         if self._auth:
             # Verifica se precisa renovar
-            fresh_token = self._auth.ensure_token()
+            fresh_token = self._auth.get_access_token()
             if fresh_token != self._trades_api._jwt:
                 self._trades_api.update_jwt(fresh_token)
 

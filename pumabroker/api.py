@@ -125,6 +125,7 @@ class TradesAPI:
         payout:      float = 0.85,
         wallet:      Optional[str] = None,
         duration:    Optional[int] = None,
+        trace_id:    Optional[str] = None,
     ) -> dict:
         """
         Envia uma ordem via POST REST.
@@ -141,6 +142,7 @@ class TradesAPI:
             payout:      Percentual de retorno (0.85 = 85%)
             wallet:      "REAL" | "DEMO" (padrão = configurado no construtor)
             duration:    Segundos até expiração (calculado automaticamente se None)
+            trace_id:    ID de rastreamento para correlação
 
         Returns:
             dict com a resposta do servidor (estrutura do tradeUpdate)
@@ -148,8 +150,15 @@ class TradesAPI:
         Raises:
             OrderError: se o servidor retornar erro
         """
+        duration_received = duration
         dur = duration or self._calc_duration(timeframe)
         w   = wallet or self._wallet
+
+        logger.info(
+            "[TIMING] PUMA_REQUEST_START traceId=%s asset=%s dir=%s duration=%s durationReceived=%s durationEffective=%s ts=%.3f",
+            trace_id or "none", symbol, direction.upper(), dur,
+            duration_received, dur, time.time()
+        )
 
         order = OrderRequest(
             userId=self._user_id,
@@ -168,15 +177,24 @@ class TradesAPI:
         payload = order.model_dump()
 
         logger.info(
-            "→ POST /trades: %s %s $%.2f %s dur=%ds wallet=%s",
-            symbol, direction.upper(), amount, timeframe, dur, w,
+            "→ POST /trades: %s %s $%.2f %s dur=%ds wallet=%s traceId=%s",
+            symbol, direction.upper(), amount, timeframe, dur, w, trace_id or "none",
         )
 
+        t0 = time.perf_counter()
+        logger.info("[AUDIT] [PUMA_API_REQUEST] asset=%s direction=%s perf=%s", symbol, direction.upper(), t0)
         try:
             resp = self._session.post(
                 config.TRADES_URL,
                 json=payload,
                 timeout=config.HTTP_TIMEOUT,
+            )
+            t1 = time.perf_counter()
+            api_ms = round((t1 - t0) * 1000, 2)
+            logger.info("[AUDIT] [PUMA_API_RESPONSE] asset=%s perf=%s duration_ms=%s", symbol, t1, api_ms)
+            logger.info(
+                "[TIMING] PUMA_REQUEST_END traceId=%s asset=%s status=%d durationMs=%s durationUsed=%d ts=%.3f",
+                trace_id or "none", symbol, resp.status_code, api_ms, dur, time.time()
             )
         except requests.exceptions.RequestException as exc:
             raise OrderError(f"Falha de rede ao enviar ordem: {exc}") from exc

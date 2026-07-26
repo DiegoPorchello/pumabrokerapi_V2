@@ -381,6 +381,10 @@ class PumaBrokerAuth:
         """Obtém access token válido (renova automaticamente se expirado)."""
         return self._token_manager.get_access_token()
 
+    def ensure_token(self) -> str:
+        """Compatibilidade com chamadas legadas. Delega para get_access_token()."""
+        return self.get_access_token()
+
     @property
     def token(self) -> str:
         """Retorna o token atual (compatibilidade)."""

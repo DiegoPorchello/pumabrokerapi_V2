@@ -59,6 +59,13 @@ class ActiveTrade:
     verify_token: str = ""
     created_at: str = ""  # When we first learned about this trade
     updated_at: str = ""  # Last update timestamp
+    result: str = ""
+    new_balance: float = 0.0
+    trade_status: str = ""
+    gross_profit: float = 0.0
+    net_profit: float = 0.0
+    trade_mode: str = ""
+    duration: int = 0
 
     def __post_init__(self):
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -159,20 +166,34 @@ class PersistenceManager:
                     (2,)
                 )
                 # Migration: add new columns if they don't exist
-                for col, default in [
-                    ("result", "''"), 
-                    ("new_balance", 0.0),
-                    ("trade_status", "''"),
-                    ("gross_profit", 0.0),
-                    ("net_profit", 0.0),
-                    ("trade_mode", "''"),
-                    ("duration", 0)
-                ]:
-                    try:
-                        conn.execute(f"ALTER TABLE active_trades ADD COLUMN {col} DEFAULT {default}")
-                    except sqlite3.OperationalError:
-                        pass
+                existing_cols = {
+                    row[1].lower()
+                    for row in conn.execute("PRAGMA table_info(active_trades)").fetchall()
+                }
+                logger.info("[DB MIGRATION] active_trades columns: %s", ", ".join(sorted(existing_cols)))
+                migrations = [
+                    ("result", "TEXT", "''"),
+                    ("new_balance", "REAL", "0.0"),
+                    ("trade_status", "TEXT", "''"),
+                    ("gross_profit", "REAL", "0.0"),
+                    ("net_profit", "REAL", "0.0"),
+                    ("trade_mode", "TEXT", "''"),
+                    ("duration", "INTEGER", "0"),
+                ]
+                added = []
+                for col, coltype, default in migrations:
+                    if col not in existing_cols:
+                        try:
+                            conn.execute(f"ALTER TABLE active_trades ADD COLUMN {col} {coltype} DEFAULT {default}")
+                            added.append(col)
+                            logger.info("[DB MIGRATION] active_trades + %s", col)
+                        except sqlite3.OperationalError as e:
+                            logger.warning("[DB MIGRATION] Failed to add column %s: %s", col, e)
                 conn.commit()
+                if added:
+                    logger.info("[DB MIGRATION] active_trades columns added: %s. Migration OK.", ", ".join(added))
+                else:
+                    logger.info("[DB MIGRATION] active_trades schema already up to date. No migration needed.")
                 logger.info("PersistenceManager: Database initialized at %s", self.db_path)
             finally:
                 conn.close()
@@ -401,7 +422,10 @@ class TradeManager:
         with self._lock:
             self._active_trades[trade.id] = trade
             self.persistence.save(trade)
-            logger.info("TradeManager: Created trade %s %s %s", trade.id, trade.symbol, trade.direction)
+            logger.info(
+                "[TIMING] RECOVERY_CREATE_TRADE tradeId=%s asset=%s dir=%s status=%s ts=%.3f",
+                trade.id, trade.symbol, trade.direction, trade.status, time.time()
+            )
             self._notify(trade)
         return trade
 
@@ -444,12 +468,16 @@ class TradeManager:
             else:
                 trade.status = status
                 trade.profit = profit
+                trade.result = result
                 trade.closed_at = trade_data.get("closedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
                 trade.exit_price = float(trade_data.get("exitPrice", trade_data.get("exit_price", trade.exit_price)))
                 trade.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
             self.persistence.save(trade)
-            logger.info("TradeManager: Updated trade %s status=%s profit=%.2f", trade.id, status, profit)
+            logger.info(
+                "[TIMING] RECOVERY_UPDATE_TRADE tradeId=%s status=%s profit=%.2f ts=%.3f",
+                trade.id, status, profit, time.time()
+            )
             self._notify(trade)
 
             if trade.is_final():
@@ -495,6 +523,7 @@ class TradeManager:
             else:
                 trade.status = status
                 trade.profit = profit
+                trade.result = result
                 if status in (TradeStatus.WIN.value, TradeStatus.LOSS.value, TradeStatus.DRAW.value):
                     trade.closed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                     trade.exit_price = float(api_trade.get("exitPrice", api_trade.get("exit_price", trade.exit_price)))

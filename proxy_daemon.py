@@ -179,18 +179,17 @@ class PersistenceManager:
                     "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                     (2,)
                 )
-                # Migration: add new columns if they don't exist
-                for col, default in [
-                    ("result", "''"), 
-                    ("new_balance", 0.0),
-                    ("trade_status", "''"),
-                    ("gross_profit", 0.0),
-                    ("net_profit", 0.0),
-                    ("trade_mode", "''"),
-                    ("duration", 0)
+                for col, dtype, default in [
+                    ("result", "TEXT", "''"),
+                    ("new_balance", "REAL", "0.0"),
+                    ("trade_status", "TEXT", "''"),
+                    ("gross_profit", "REAL", "0.0"),
+                    ("net_profit", "REAL", "0.0"),
+                    ("trade_mode", "TEXT", "''"),
+                    ("duration", "INTEGER", "0")
                 ]:
                     try:
-                        conn.execute(f"ALTER TABLE active_trades ADD COLUMN {col} DEFAULT {default}")
+                        conn.execute(f"ALTER TABLE active_trades ADD COLUMN {col} {dtype} DEFAULT {default}")
                     except sqlite3.OperationalError:
                         pass
                 conn.commit()
@@ -207,15 +206,13 @@ class PersistenceManager:
     def save(self, trade: ActiveTrade) -> bool:
         """Save or update a trade. Returns True if inserted, False if updated."""
         with self._lock:
-            conn = self._get_conn()
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
             try:
                 existing = conn.execute("SELECT id FROM active_trades WHERE id = ?", (trade.id,)).fetchone()
                 trade.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 data = trade.to_dict()
-                
-                # trade_status alias
                 data["trade_status"] = data.get("status", "")
-                
                 if existing:
                     conn.execute("""
                         UPDATE active_trades SET
@@ -231,8 +228,9 @@ class PersistenceManager:
                         data["expires_at"], data["closed_at"], data["exit_price"],
                         data["wallet"], data["timeframe"], data["verify_token"],
                         data["updated_at"], data["result"], data["new_balance"],
-                        data["trade_status"], data["gross_profit"], data["net_profit"],
-                        data["trade_mode"], data["duration"],
+                        data.get("trade_status", ""),
+                        data.get("gross_profit", 0.0), data.get("net_profit", 0.0),
+                        data.get("trade_mode", ""), data.get("duration", 0),
                         data["id"]
                     ))
                     conn.commit()
@@ -252,8 +250,10 @@ class PersistenceManager:
                         data["opened_at"], data["expires_at"], data["closed_at"],
                         data["exit_price"], data["wallet"], data["timeframe"],
                         data["verify_token"], data["created_at"], data["updated_at"],
-                        data["result"], data["new_balance"], data["trade_status"],
-                        data["gross_profit"], data["net_profit"], data["trade_mode"], data["duration"]
+                        data["result"], data["new_balance"],
+                        data.get("trade_status", ""),
+                        data.get("gross_profit", 0.0), data.get("net_profit", 0.0),
+                        data.get("trade_mode", ""), data.get("duration", 0)
                     ))
                     conn.commit()
                     return True
@@ -338,222 +338,6 @@ class PersistenceManager:
 
     def clear_all(self) -> int:
         with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            try:
-                cursor = conn.execute("DELETE FROM active_trades")
-                conn.commit()
-                return cursor.rowcount
-            finally:
-                conn.close()
-
-    def close(self):
-        pass  # SQLite connections are per-operation
-
-
-class PersistenceManager:
-    """
-    Handles local persistence of active trades using SQLite.
-    Thread-safe with connection pooling.
-    """
-
-    DB_FILE = "active_trades.db"
-    SCHEMA_VERSION = 1
-
-    def __init__(self, db_path: Optional[str] = None):
-        self.db_path = db_path or "active_trades.db"
-        self._lock = threading.RLock()
-        self._init_db()
-
-    def _init_db(self):
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            try:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS active_trades (
-                        id TEXT PRIMARY KEY,
-                        symbol TEXT NOT NULL,
-                        direction TEXT NOT NULL,
-                        amount REAL NOT NULL,
-                        entry_price REAL NOT NULL,
-                        payout REAL NOT NULL,
-                        status TEXT NOT NULL,
-                        profit REAL DEFAULT 0.0,
-                        opened_at TEXT NOT NULL,
-                        expires_at TEXT NOT NULL,
-                        closed_at TEXT DEFAULT '',
-                        exit_price REAL DEFAULT 0.0,
-                        wallet TEXT DEFAULT 'REAL',
-                        timeframe TEXT DEFAULT 'M1',
-                        verify_token TEXT DEFAULT '',
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        result TEXT DEFAULT '',
-                        new_balance REAL DEFAULT 0.0
-                    )
-                """)
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_active_trades_status 
-                    ON active_trades(status)
-                """)
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_active_trades_expires 
-                    ON active_trades(expires_at)
-                """)
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS schema_version (
-                        version INTEGER PRIMARY KEY
-                    )
-                """)
-                conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
-                    (1,)
-                )
-                # Migration: add new columns if they don't exist
-                for col, default in [("result", ""), ("new_balance", 0.0)]:
-                    try:
-                        conn.execute(f"ALTER TABLE active_trades ADD COLUMN {col} DEFAULT ?", (default,))
-                    except sqlite3.OperationalError:
-                        pass
-                conn.commit()
-                logger.info("PersistenceManager: Database initialized at %s", self.db_path)
-            finally:
-                conn.close()
-
-    def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def save(self, trade: ActiveTrade) -> bool:
-        """Save or update a trade. Returns True if inserted, False if updated."""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            try:
-                existing = conn.execute("SELECT id FROM active_trades WHERE id = ?", (trade.id,)).fetchone()
-                trade.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                data = trade.to_dict()
-                if existing:
-                    conn.execute("""
-                        UPDATE active_trades SET
-                            symbol=?, direction=?, amount=?, entry_price=?, payout=?,
-                            status=?, profit=?, opened_at=?, expires_at=?, closed_at=?,
-                            exit_price=?, wallet=?, timeframe=?, verify_token=?,
-                            updated_at=?, result=?, new_balance=?
-                        WHERE id=?
-                    """, (
-                        data["symbol"], data["direction"], data["amount"], data["entry_price"],
-                        data["payout"], data["status"], data["profit"], data["opened_at"],
-                        data["expires_at"], data["closed_at"], data["exit_price"],
-                        data["wallet"], data["timeframe"], data["verify_token"],
-                        data["updated_at"], data["result"], data["new_balance"],
-                        data["id"]
-                    ))
-                    conn.commit()
-                    return False
-                else:
-                    conn.execute("""
-                        INSERT INTO active_trades (
-                            id, symbol, direction, amount, entry_price, payout,
-                            status, profit, opened_at, expires_at, closed_at,
-                            exit_price, wallet, timeframe, verify_token,
-                            created_at, updated_at, result, new_balance
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        data["id"], data["symbol"], data["direction"], data["amount"],
-                        data["entry_price"], data["payout"], data["status"], data["profit"],
-                        data["opened_at"], data["expires_at"], data["closed_at"],
-                        data["exit_price"], data["wallet"], data["timeframe"],
-                        data["verify_token"], data["created_at"], data["updated_at"],
-                        data["result"], data["new_balance"]
-                    ))
-                    conn.commit()
-                    return True
-            finally:
-                conn.close()
-
-    def delete(self, trade_id: str) -> bool:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            try:
-                cursor = conn.execute("DELETE FROM active_trades WHERE id = ?", (trade_id,))
-                conn.commit()
-                return cursor.rowcount > 0
-            finally:
-                conn.close()
-
-    def get(self, trade_id: str) -> Optional[ActiveTrade]:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            try:
-                row = conn.execute("SELECT * FROM active_trades WHERE id = ?", (trade_id,)).fetchone()
-                if row:
-                    return ActiveTrade(**dict(row))
-                return None
-            finally:
-                conn.close()
-
-    def get_all(self) -> List[ActiveTrade]:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute("SELECT * FROM active_trades ORDER BY created_at DESC").fetchall()
-                return [ActiveTrade(**dict(row)) for row in rows]
-            finally:
-                conn.close()
-
-    def get_active(self) -> List[ActiveTrade]:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute(
-                    "SELECT * FROM active_trades WHERE status IN (?, ?) ORDER BY created_at DESC",
-                    ("PENDING", "ACTIVE")
-                ).fetchall()
-                return [ActiveTrade(**dict(row)) for row in rows]
-            finally:
-                conn.close()
-
-    def get_expired_active(self, grace_seconds: int = 15) -> List[ActiveTrade]:
-        """Get trades that are ACTIVE/PENDING but past their expiry + grace period"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute(
-                    "SELECT * FROM active_trades WHERE status IN (?, ?)",
-                    ("PENDING", "ACTIVE")
-                ).fetchall()
-                expired = []
-                for row in rows:
-                    trade = ActiveTrade(**dict(row))
-                    if trade.is_expired(grace_seconds):
-                        expired.append(trade)
-                return expired
-            finally:
-                conn.close()
-
-    def count_active(self) -> int:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            try:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM active_trades WHERE status IN (?, ?)",
-                    ("PENDING", "ACTIVE")
-                ).fetchone()
-                return row[0] if row else 0
-            finally:
-                conn.close()
-
-    def clear_all(self) -> int:
-        with self.__lock:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             try:
                 cursor = conn.execute("DELETE FROM active_trades")
@@ -694,7 +478,7 @@ class TradeManager:
                     exit_price=float(trade_data.get("exitPrice", trade_data.get("exit_price", 0))),
                     wallet=trade_data.get("wallet", "REAL"),
                     timeframe=trade_data.get("timeframe", "M1"),
-                    result=result,
+                    result=final_status,
                     new_balance=new_balance,
                     trade_mode=str(trade_data.get("tradeMode", "")),
                     duration=int(trade_data.get("duration", 0)),
@@ -703,7 +487,7 @@ class TradeManager:
             else:
                 trade.status = final_status
                 trade.profit = profit
-                trade.result = result
+                trade.result = final_status
                 trade.new_balance = new_balance
                 trade.closed_at = trade_data.get("closedAt", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
                 trade.exit_price = float(trade_data.get("exitPrice", trade_data.get("exit_price", trade.exit_price)))
@@ -1016,6 +800,10 @@ class PumaDaemon:
     _log_buffer: list[dict] = []
     _MAX_LOG_BUFFER = 20000
 
+    # Buffer circular de logs de copy trade (visível na UI)
+    _copy_log_buffer: list[dict] = []
+    _MAX_COPY_LOG_BUFFER = 200
+
     # Circuit breaker para re-login automático do WS2
     MAX_RELOGIN_ATTEMPTS = 3
     _relogin_failures: int = 0
@@ -1114,7 +902,15 @@ class PumaDaemon:
                     return
                 status = data.get("status", "ACTIVE")
                 profit = float(data.get("profit", 0))
-                result = status.lower() if status != "ACTIVE" else "pending"
+                normalized = status.upper()
+                if normalized in ("WON", "WIN"):
+                    result = "win"
+                elif normalized in ("LOST", "LOSS"):
+                    result = "loss"
+                elif normalized == "DRAW":
+                    result = "draw"
+                else:
+                    result = "pending"
 
                 # ── RECOVERY: Atualiza TradeManager para persistir status em tempo real ──
                 trade = self._daemon.trade_manager.update_from_poll(data)
@@ -1185,7 +981,7 @@ class PumaDaemon:
                 for entry in self._daemon._trade_history:
                     if entry.get("id") == trade_id:
                         entry["status"] = final_status
-                        entry["result"] = result.lower()
+                        entry["result"] = final_status.lower()
                         entry["profit"] = profit
                         entry["newBalance"] = new_balance
                         entry["exitPrice"] = trade_data.get("exitPrice", entry.get("exitPrice"))
@@ -1226,6 +1022,17 @@ class PumaDaemon:
         if level:
             logs = [e for e in logs if e.get("level", "").upper() == level.upper()]
         return logs[-limit:]
+
+    @classmethod
+    def push_copy_log(cls, entry: dict):
+        entry["timestamp"] = time.time()
+        cls._copy_log_buffer.append(entry)
+        if len(cls._copy_log_buffer) > cls._MAX_COPY_LOG_BUFFER:
+            cls._copy_log_buffer = cls._copy_log_buffer[-cls._MAX_COPY_LOG_BUFFER:]
+
+    @classmethod
+    def get_copy_logs(cls, limit: int = 50) -> list[dict]:
+        return cls._copy_log_buffer[-limit:]
 
     def __init__(self):
         self._auth: PumaBrokerAuth | None = None
@@ -1295,7 +1102,7 @@ class PumaDaemon:
                     "active": acc_data.get("active", True),
                     "api": None,
                     "auth": None,
-                    "last_error": acc_data.get("last_error"),
+                    "last_error": None,  # Limpa erros anteriores — será reavaliado no próximo login
                     "last_sync_at": datetime.fromisoformat(acc_data["last_sync_at"]) if acc_data.get("last_sync_at") else None,
                     "initial_balance": acc_data.get("initial_balance", 0),
                     "total_trades": acc_data.get("total_trades", 0),
@@ -1343,7 +1150,8 @@ class PumaDaemon:
         if auth is None:
             return 0.0
         try:
-            auth.ensure_token()
+            auth.get_access_token()
+            logger.info("[AUTH] Access Token obtido para conta copy %s", auth.email if hasattr(auth, 'email') else "?")
             url = f"{config.BASE_URL}/api/v1/users/{auth.user_id}"
             r = auth.http.get(url, timeout=config.HTTP_TIMEOUT)
             if r.status_code == 401:
@@ -1574,6 +1382,18 @@ class PumaDaemon:
         token = self._ensure_token()
         payout = body.get("payout", 0.85)
         timeframe = body.get("timeframe") or self._expiration_to_timeframe(body.get("expiration", 60))
+        trace_id = body.get("traceId", "")
+        signal_candle_time = body.get("signalCandleTime", 0)
+        signal_candle_open = body.get("signalCandleOpen", 0)
+        signal_candle_close = body.get("signalCandleClose", 0)
+        candle_id = body.get("candleId", "")
+        duration_received = body.get("durationReceived", body.get("expiration", 60))
+
+        logger.info(
+            "[TIMING] DAEMON_START traceId=%s asset=%s dir=%s duration=%s durationReceived=%s signalCandle=%s candleId=%s ts=%.3f",
+            trace_id, body["asset"], body["direction"], body.get("expiration", 60),
+            duration_received, signal_candle_time, candle_id, time.time()
+        )
 
         # ── DETECÇÃO DE DUPLICATAS ──
         now = time.time()
@@ -1599,6 +1419,10 @@ class PumaDaemon:
 
         try:
             _t_start_send = time.perf_counter()
+            logger.info(
+                "[TIMING] DAEMON_BEFORE_PUMA traceId=%s asset=%s dir=%s ts=%.3f",
+                trace_id, body["asset"], body["direction"], time.time()
+            )
             result = self._trades_api.place_order(
                 symbol=body["asset"],
                 direction=body["direction"],
@@ -1607,10 +1431,16 @@ class PumaDaemon:
                 entry_price=body.get("entryPrice", 0),
                 payout=payout,
                 wallet="DEMO" if body.get("isDemo", True) else "REAL",
+                trace_id=trace_id,
             )
             _t1 = time.perf_counter()
             puma_ms = round((_t1 - (_t_start_send or _t0)) * 1000)
             total_ms = round((_t1 - _t0) * 1000)
+            logger.info(
+                "[TIMING] DAEMON_AFTER_PUMA traceId=%s orderId=%s status=%s pumaMs=%d totalMs=%d expiresAt=%s ts=%.3f",
+                trace_id, result.get("id", ""), result.get("status", ""), puma_ms, total_ms,
+                result.get("expiresAt", "none"), time.time()
+            )
             logger.info(f"[LATENCY] place_trade: proxy_routing={round(((_t_start_send or _t0) - _t0) * 1000)}ms puma_api={puma_ms}ms total={total_ms}ms")
         except OrderError as e:
             if e.status_code != 401:
@@ -1628,6 +1458,7 @@ class PumaDaemon:
                 entry_price=body.get("entryPrice", 0),
                 payout=payout,
                 wallet="DEMO" if body.get("isDemo", True) else "REAL",
+                trace_id=trace_id,
             )
             _t2 = time.perf_counter()
             logger.info(f"[LATENCY] place_trade RETRY: puma_api={round((_t2 - _t_retry) * 1000)}ms total={round((_t2 - _t0) * 1000)}ms")
@@ -1656,24 +1487,58 @@ class PumaDaemon:
         # A flag _copy_user_confirmed NUNCA persiste no arquivo, entao mesmo que o arquivo
         # .copy_sessions.json tenha "enabled": true, a copia nao roda apos restart.
         n_copies = 0
-        if self._copy_enabled and not self._copy_user_confirmed:
+        asset = body.get("asset", "")
+        direction = body.get("direction", "")
+        timeframe = body.get("timeframe", "")
+        if not self._copy_enabled:
+            logger.debug("Copy trade desativado (_copy_enabled=False) — cópia ignorada para %s", asset)
+        elif self._copy_enabled and not self._copy_user_confirmed:
             logger.warning(
                 "COPY TRADE BLOQUEADO: _copy_enabled=True mas _copy_user_confirmed=False. "
                 "Usuario precisa ativar copy via toggle explicito na interface."
             )
-        if self._copy_enabled and self._copy_user_confirmed:
+            PumaDaemon.push_copy_log({
+                "type": "blocked", "asset": asset, "direction": direction,
+                "timeframe": timeframe, "reason": "Copy desativado — toggle não confirmado",
+            })
+        elif self._copy_enabled and self._copy_user_confirmed:
+            if not self._copy_sessions:
+                logger.debug("Copy trade ativo mas sem contas cadastradas — nenhuma cópia para %s", asset)
             for acc in self._copy_sessions:
                 if not acc["active"]:
+                    logger.info("Copy trade SKIP: conta %s desativada — cópia ignorada", acc["label"])
+                    PumaDaemon.push_copy_log({
+                        "type": "skipped", "asset": asset, "direction": direction,
+                        "timeframe": timeframe, "account": acc["label"],
+                        "reason": "Conta desativada",
+                    })
                     continue
                 # Lazy login: se a conta não tem auth/api, cria agora
                 if acc.get("auth") is None or acc.get("api") is None:
                     try:
-                        self._copy_account_lazy_login(acc)
+                        login_ok = self._copy_account_lazy_login(acc)
+                        if not login_ok:
+                            logger.warning("Copy trade SKIP: lazy login retornou False para %s", acc["label"])
+                            PumaDaemon.push_copy_log({
+                                "type": "skipped", "asset": asset, "direction": direction,
+                                "timeframe": timeframe, "account": acc["label"],
+                                "reason": "Lazy login falhou",
+                            })
+                            continue
                     except Exception as e:
                         acc["last_error"] = str(e)[:200]
                         logger.warning("Copy trade lazy login FAIL: %s — %s", acc["label"], str(e)[:200])
+                        PumaDaemon.push_copy_log({
+                            "type": "error", "asset": asset, "direction": direction,
+                            "timeframe": timeframe, "account": acc["label"],
+                            "reason": str(e)[:200],
+                        })
                         continue
                 n_copies += 1
+                logger.info(
+                    "[TIMING] COPY_DISPATCH traceId=%s account=%s ts=%.3f",
+                    trace_id, acc["label"], time.time()
+                )
                 t = threading.Thread(
                     target=self._executar_copy_em_thread,
                     args=(acc, body, payout),
@@ -1703,29 +1568,59 @@ class PumaDaemon:
 
         return result
 
-        return result
-
     def _executar_copy_em_thread(self, acc: dict, body: dict, payout: float) -> None:
         """Executa copy trade em thread separada (fire-and-forget).
         Falhas são logadas e registradas na conta, NUNCA propagam exceção."""
+        trace_id = body.get("traceId", "")
+        asset = body.get("asset", "")
+        direction = body.get("direction", "")
+        timeframe = body.get("timeframe", "")
+        logger.info(
+            "[TIMING] COPY_THREAD_START traceId=%s account=%s ts=%.3f",
+            trace_id, acc["label"], time.time()
+        )
         try:
             self._copy_place_trade(acc, body, payout)
+            PumaDaemon.push_copy_log({
+                "type": "success", "asset": asset, "direction": direction,
+                "timeframe": timeframe, "account": acc["label"],
+            })
         except OrderError as e:
             if e.status_code == 401:
                 try:
                     acc["auth"].login()
-                    fresh = acc["auth"].ensure_token()
+                    fresh = acc["auth"].get_access_token()
                     acc["api"].update_jwt(fresh)
                     self._copy_place_trade(acc, body, payout)
+                    PumaDaemon.push_copy_log({
+                        "type": "success", "asset": asset, "direction": direction,
+                        "timeframe": timeframe, "account": acc["label"],
+                        "note": "retry_ok",
+                    })
                 except Exception as e2:
                     acc["last_error"] = str(e2)[:200]
                     logger.warning("Copy trade retry FAIL: %s — %s", acc["label"], str(e2)[:200])
+                    PumaDaemon.push_copy_log({
+                        "type": "error", "asset": asset, "direction": direction,
+                        "timeframe": timeframe, "account": acc["label"],
+                        "reason": str(e2)[:200],
+                    })
             else:
                 acc["last_error"] = str(e)[:200]
                 logger.warning("Copy trade FAIL: %s — %s", acc["label"], str(e)[:200])
+                PumaDaemon.push_copy_log({
+                    "type": "error", "asset": asset, "direction": direction,
+                    "timeframe": timeframe, "account": acc["label"],
+                    "reason": str(e)[:200],
+                })
         except Exception as e:
             acc["last_error"] = str(e)[:200]
             logger.warning("Copy trade FAIL: %s — %s", acc["label"], str(e)[:200])
+            PumaDaemon.push_copy_log({
+                "type": "error", "asset": asset, "direction": direction,
+                "timeframe": timeframe, "account": acc["label"],
+                "reason": str(e)[:200],
+            })
 
     def list_trades(self, limit: int = 50) -> list[dict]:
         """Retorna histórico de trades usando APENAS o TradeManager (persistido em SQLite).
@@ -1799,9 +1694,18 @@ class PumaDaemon:
 
     def _copy_place_trade(self, acc: dict, body: dict, payout: float) -> dict:
         """Executa uma ordem em uma conta copy, com renovação de token se necessário."""
-        fresh = acc["auth"].ensure_token()
+        trace_id = body.get("traceId", "")
+        duration_received = body.get("durationReceived", body.get("expiration", 60))
+        logger.info("[COPY] Validando token para conta %s...", acc["label"])
+        fresh = acc["auth"].get_access_token()
         if fresh != acc["api"]._jwt:
             acc["api"].update_jwt(fresh)
+        logger.info("[COPY] Token OK — Account=%s", acc["label"])
+        t0 = time.perf_counter()
+        logger.info(
+            "[TIMING] COPY_BEFORE_PUMA traceId=%s account=%s ts=%.3f",
+            trace_id, acc["label"], time.time()
+        )
         order_result = acc["api"].place_order(
             symbol=body["asset"],
             direction=body["direction"],
@@ -1811,6 +1715,8 @@ class PumaDaemon:
             payout=payout,
             wallet="DEMO" if acc["is_demo"] else "REAL",
         )
+        t1 = time.perf_counter()
+        copy_ms = round((t1 - t0) * 1000)
         acc["last_error"] = None
         acc["last_sync_at"] = datetime.now()
         acc["total_trades"] += 1
@@ -1823,8 +1729,37 @@ class PumaDaemon:
             acc["total_losses"] += 1
             amount = float(body.get("amount", 0))
             acc["total_profit"] -= amount
+        logger.info(
+            "[TIMING] COPY_AFTER_PUMA traceId=%s account=%s orderId=%s status=%s copyMs=%d ts=%.3f",
+            trace_id, acc["label"], order_result.get("id", ""), order_status, copy_ms, time.time()
+        )
         logger.info("Copy trade OK: %s (total trades: %d)", acc["label"], acc["total_trades"])
         return order_result
+
+    def copy_test_account(self, account_id: str) -> dict:
+        """Testa conexão de uma conta copy (login + fetch saldo)."""
+        for acc in self._copy_sessions:
+            if acc["id"] == account_id:
+                try:
+                    auth = PumaBrokerAuth(acc["email"], acc["_password"])
+                    session = auth.login()
+                    balance = self._copy_fetch_balance(auth, acc["is_demo"])
+                    acc["auth"] = auth
+                    acc["api"] = TradesAPI(
+                        jwt_token=session.token,
+                        user_id=session.user_id,
+                        wallet="DEMO" if acc["is_demo"] else "REAL",
+                    )
+                    acc["last_error"] = None
+                    acc["initial_balance"] = balance
+                    acc["started_at"] = datetime.now()
+                    logger.info("Copy test OK: %s — balance=%.2f", acc["label"], balance)
+                    return {"success": True, "balance": balance, "user_id": session.user_id}
+                except Exception as e:
+                    acc["last_error"] = str(e)[:200]
+                    logger.warning("Copy test FAIL: %s — %s", acc["label"], e)
+                    return {"success": False, "error": str(e)[:200]}
+        return {"success": False, "error": "Conta não encontrada"}
 
     def get_ws2_session(self, force_refresh: bool = False) -> str:
         """Retorna o JWT accessToken como token WS2.
@@ -2088,8 +2023,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             elif path == "/trades":
                 body = self._read_body()
+                t0 = time.perf_counter()
+                logger.info("[AUDIT] [DAEMON_POST_TRADES_START] asset=%s direction=%s perf=%s", body.get("asset"), body.get("direction"), t0)
                 result = daemon.place_trade(body)
+                t1 = time.perf_counter()
                 trade_id = result.get("id", "")
+                logger.info("[AUDIT] [DAEMON_POST_TRADES_END] asset=%s orderId=%s perf=%s duration_ms=%s", body.get("asset"), trade_id, t1, round((t1 - t0) * 1000, 2))
                 logger.info(
                     "🔍 TRADE CRIADA | asset=%s dir=%s | id=%s | result_full=%s",
                     body.get("asset"), body.get("direction"),
@@ -2119,14 +2058,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._send(400, {"error": f"Erro ao adicionar conta: {e}"})
 
-            elif path == "/logs":
+            elif path == "/copy/accounts/test":
                 body = self._read_body()
-                if isinstance(body, list):
-                    for entry in body:
-                        PumaDaemon.push_log(entry)
-                elif isinstance(body, dict):
-                    PumaDaemon.push_log(body)
-                self._send(200, {"ok": True})
+                account_id = body.get("account_id", "")
+                if not account_id:
+                    self._send(400, {"error": "account_id é obrigatório"})
+                    return
+                result = daemon.copy_test_account(account_id)
+                if result["success"]:
+                    self._send(200, result)
+                else:
+                    self._send(400, result)
 
             elif path == "/logs":
                 body = self._read_body()
@@ -2179,10 +2121,28 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path.startswith("/trades/"):
                 order_id = path.split("/")[-1]
                 result = daemon.get_trade(order_id)
-                self._send(200, result)
+                if result is None:
+                    self._send(404, {"error": "Trade não encontrada"})
+                else:
+                    self._send(200, result)
 
             elif path == "/health":
-                self._send(200, {"status": "ok"})
+                token_valid = daemon._token_manager.has_valid_access_token() if daemon._token_manager else False
+                broker_connected = (
+                    daemon._auth is not None
+                    and daemon._token_manager is not None
+                    and token_valid
+                )
+                ws_connected = daemon._trade_ws.trades_connected if hasattr(daemon, '_trade_ws') else False
+                self._send(200, {
+                    "status": "ok",
+                    "broker_connected": broker_connected,
+                    "ws_connected": ws_connected,
+                    "copy_enabled": daemon._copy_enabled,
+                    "copy_user_confirmed": daemon._copy_user_confirmed,
+                    "copy_accounts": len(daemon._copy_sessions),
+                    "copy_active_accounts": sum(1 for a in daemon._copy_sessions if a["active"]),
+                })
 
             elif path == "/ws2-session":
                 query = parse_qs(urlparse(self.path).query)
@@ -2220,6 +2180,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path == "/copy/status":
                 result = daemon.copy_get_status()
                 self._send(200, result)
+
+            elif path == "/copy/logs":
+                query = parse_qs(urlparse(self.path).query)
+                limit = int(query.get("limit", ["50"])[0])
+                result = PumaDaemon.get_copy_logs(limit=limit)
+                self._send(200, {"logs": result})
 
             elif path == "/logs":
                 query = parse_qs(urlparse(self.path).query)

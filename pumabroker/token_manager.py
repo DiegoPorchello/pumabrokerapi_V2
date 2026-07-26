@@ -281,6 +281,10 @@ class TokenManager:
         """Retorna dados completos dos tokens."""
         return self._tokens
 
+    def has_valid_access_token(self) -> bool:
+        """Verifica se existe access token válido e não expirado."""
+        return self._tokens.is_valid()
+
     def update_from_login(self, session: UserSession) -> None:
         """Atualiza tokens a partir de sessão de login (método público)."""
         self._update_tokens_from_login(session)

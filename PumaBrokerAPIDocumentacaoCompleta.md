@@ -453,7 +453,7 @@ from_ts = int(time.time()) - (count * tf_seconds * 3)
 
 **Causa:** token JWT expira em ~24h.  
 **Fix:** chamar `POST /login` novamente e atualizar o header `Authorization`.  
-**No código Python:** `auth.ensure_token()` renova automaticamente.
+**No código Python:** `auth.get_access_token()` renova automaticamente.
 
 ---
 
