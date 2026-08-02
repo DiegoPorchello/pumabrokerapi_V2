@@ -20,7 +20,7 @@ import socketio
 from dotenv import load_dotenv
 
 load_dotenv()
-from pumabroker.auth import PumaBrokerAuth, AuthError
+from pumabroker.auth import PumaBrokerAuth, AuthError, _login_backoff_until
 from pumabroker.token_manager import TokenManager, get_token_manager
 from pumabroker.api import TradesAPI, OrderError
 from pumabroker.config import config
@@ -1335,6 +1335,11 @@ class PumaDaemon:
 
     def _ensure_token(self):
         self._ensure_auth()
+        # Backoff check: não força refresh se estamos em backoff
+        now = time.time()
+        if now < _login_backoff_until:
+            logger.debug("[AUTH] _ensure_token: backoff ativo, usando token atual")
+            return self._token_manager.tokens.access_token if self._token_manager.tokens.access_token else self._token_manager.get_access_token()
         fresh = self._token_manager.get_access_token()
         if self._trades_api and fresh != self._trades_api._jwt:
             self._trades_api.update_jwt(fresh)
@@ -1623,14 +1628,24 @@ class PumaDaemon:
             })
 
     def list_trades(self, limit: int = 50) -> list[dict]:
-        """Retorna histórico de trades usando APENAS o TradeManager (persistido em SQLite).
+        """Retorna histórico de trades usando TradeManager + _trade_history.
         
         Trades são resolvidos exclusivamente via eventos WebSocket tradeResult.
-        Não faz chamadas REST para status de trades (endpoints /api/v1/trades e
-        /api/v1/trades/{id} retornam 404 na API da Puma).
+        Faz merge de ambas as fontes para garantir que nenhuma trade seja perdida.
         """
-        trades = self.trade_manager.get_all()[:limit]
-        return [self._trade_to_dict(t) for t in trades]
+        # Trades do TradeManager (persistidos em SQLite)
+        tm_trades = self.trade_manager.get_all()[:limit]
+        tm_dict = {t.id: self._trade_to_dict(t) for t in tm_trades}
+        
+        # Merge com _trade_history (lista em memória populada por place_trade)
+        for entry in self._trade_history:
+            tid = entry.get("id", "")
+            if tid and tid not in tm_dict:
+                tm_dict[tid] = entry
+        
+        # Ordena por openedAt (mais recente primeiro) e limita
+        result = sorted(tm_dict.values(), key=lambda x: x.get("openedAt", 0), reverse=True)[:limit]
+        return result
 
     def _trade_to_dict(self, trade: ActiveTrade) -> dict:
         """Converte ActiveTrade para dict compatível com GET /trades"""
@@ -1657,10 +1672,20 @@ class PumaDaemon:
 
     def get_trade(self, order_id: str) -> dict:
         """Retorna trade do TradeManager (persistido em SQLite).
-        Trades são resolvidos via WebSocket tradeResult, não via REST API."""
+        Trades são resolvidos via WebSocket tradeResult, não via REST API.
+        Se não encontrar no TradeManager, busca em _trade_history como fallback."""
         trade = self.trade_manager.get(order_id)
         if trade:
+            logger.info("ENDPOINT: /trades/%s found in TradeManager status=%s", order_id, trade.status)
             return self._trade_to_dict(trade)
+        
+        # Fallback: buscar em _trade_history (lista em memória populada por place_trade)
+        for entry in self._trade_history:
+            if entry.get("id") == order_id:
+                logger.info("ENDPOINT: /trades/%s found in _trade_history status=%s (fallback)", order_id, entry.get("status", "ACTIVE"))
+                return entry
+        
+        logger.warning("ENDPOINT: /trades/%s NOT FOUND in TradeManager or _trade_history", order_id)
         return None
 
     def place_trade_for_recovery(self, body: dict) -> dict:
@@ -1768,10 +1793,29 @@ class PumaDaemon:
         para obter um token fresco. Inclui circuit breaker para evitar loops
         infinitos de re-login — após MAX_RELOGIN_ATTEMPTS falhas consecutivas,
         exige login manual pelo frontend.
+
+        Respeita backoff de HTTP 429.
         """
         import time
         from datetime import datetime
         self._ensure_auth()
+
+        # ── Backoff check: se estamos em backoff, não re-login ──
+        now = time.time()
+        if now < _login_backoff_until:
+            remaining = int(_login_backoff_until - now)
+            logger.warning(
+                "[AUTH] WS2 RE-LOGIN SKIPPED — backoff ativo, aguardar %ds",
+                remaining,
+            )
+            # Retorna token atual se disponível
+            auth = self._get_auth()
+            if auth.ws2_token:
+                return auth.ws2_token
+            raise AuthError(
+                f"WS2 re-login bloqueado por backoff — aguarde {remaining}s",
+                status_code=429,
+            )
 
         # Diagnóstico detalhado do que disparou a necessidade de re-login
         auth = self._get_auth()
@@ -2122,8 +2166,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 order_id = path.split("/")[-1]
                 result = daemon.get_trade(order_id)
                 if result is None:
+                    logger.warning(
+                        "ENDPOINT_ERROR: /trades/%s retornou 404 - tradeId=%s endpoint=%s time_opened=",
+                        order_id, order_id, f"/trades/{order_id}", daemon._active_trades.get(order_id).opened_at if daemon._active_trades.get(order_id) else "unknown"
+                    );
                     self._send(404, {"error": "Trade não encontrada"})
                 else:
+                    logger.info("ENDPOINT: /trades/%s status=200 tradeId=%s result.status=%s", order_id, order_id, result.get("status", "ACTIVE"))
                     self._send(200, result)
 
             elif path == "/health":
