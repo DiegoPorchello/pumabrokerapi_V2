@@ -46,6 +46,12 @@ logging.basicConfig(
 logger = logging.getLogger("forward_testing")
 
 
+TIMEFRAME_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "D1": 86400,
+}
+
+
 class ForwardTestingBridge:
     """
     Ponte entre o Supabase (TS) e a Puma Broker (Python).
@@ -78,6 +84,9 @@ class ForwardTestingBridge:
         self._current_session_id: Optional[str] = None
         self._latest_candles: dict = {}
         self._open_trades: dict = {}
+        self._last_candle_time: dict = {}  # Timestamp do último candle por símbolo
+        self._pending_signals: dict = {}  # Sinais pendentes por símbolo
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None  # Event loop para thread-safe
 
     # ── Ciclo de vida ─────────────────────────────────────────────────────────
 
@@ -109,6 +118,7 @@ class ForwardTestingBridge:
 
         await self._broker.connect()
         self._running = True
+        self._event_loop = asyncio.get_event_loop()  # Salva referência do event loop
 
         # Registra handlers
         interval = timeframe.replace("M", "").replace("H", "")
@@ -132,16 +142,70 @@ class ForwardTestingBridge:
             "running": self._running,
             "session_id": self._current_session_id,
             "open_trades": len(self._open_trades),
+            "pending_signals": len(self._pending_signals),
             "latest_candles": {
-                k: v.get("close") for k, v in self._latest_candles.items()
+                k: {
+                    "close": v.get("close"),
+                    "age": v.get("age", 0),
+                }
+                for k, v in self._latest_candles.items()
             },
         }
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
     def _on_bar(self, bar: BarUpdateEvent) -> None:
-        """Callback de candle em tempo real."""
+        """Callback de candle em tempo real (chamado de thread do WebSocket)."""
+        import time
+        now = time.time()
+        
         key = f"{bar.symbol}:{bar.interval}"
+        
+        # Detecta se um novo candle nasceu
+        last_time = self._last_candle_time.get(key, 0)
+        new_candle_detected = bar.bar.time != last_time
+        
+        if new_candle_detected:
+            logger.info(f"🕯️ Novo candle detectado para {bar.symbol}: {bar.bar.time}")
+            
+            # Se havia sinal pendente e o candle anterior atrasou, executar no novo candle
+            if key in self._pending_signals:
+                pending = self._pending_signals.pop(key)
+                
+                # Verifica se o sinal ainda é válido (não expirou)
+                signal_age = now - pending.get('timestamp', now)
+                timeframe_s = TIMEFRAME_SECONDS.get(pending.get('timeframe', 'M1'), 60)
+                max_age = timeframe_s * 2  # 2 timeframes de tolerância
+                
+                if signal_age > max_age:
+                    logger.warning(
+                        f"Sinal pendente {pending['direction']} expirado "
+                        f"({signal_age:.1f}s > {max_age}s). Descartando."
+                    )
+                else:
+                    logger.info(
+                        f"⚡ Executando sinal pendente {pending['direction']} "
+                        f"no novo candle! (idade: {signal_age:.1f}s)"
+                    )
+                    # Thread-safe: usa call_soon_threadsafe para agendar no event loop
+                    if self._event_loop and self._event_loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.execute_signal(
+                                symbol=bar.symbol,
+                                direction=pending['direction'],
+                                amount=pending['amount'],
+                                timeframe=pending['timeframe'],
+                                entry_price=bar.bar.close,
+                                payout=pending.get('payout', 0.85),
+                                session_id=pending.get('session_id'),
+                            ),
+                            self._event_loop,
+                        )
+                    else:
+                        logger.error("Event loop não disponível — não é possível executar sinal pendente")
+            
+            self._last_candle_time[key] = bar.bar.time
+        
         self._latest_candles[key] = {
             "close": bar.bar.close,
             "open": bar.bar.open,
@@ -149,6 +213,7 @@ class ForwardTestingBridge:
             "low": bar.bar.low,
             "volume": bar.bar.volume,
             "time": bar.bar.time,
+            "age": now - bar.bar.time,  # Idade do candle em segundos
         }
 
     def _on_trade_result(self, event: str, trade: TradeUpdate) -> None:
@@ -243,23 +308,67 @@ class ForwardTestingBridge:
         entry_price: float = 0.0,
         payout: float = 0.85,
         session_id: Optional[str] = None,
+        force_execute: bool = False,
     ) -> dict:
         """
         Executa uma ordem baseada em sinal do Score Engine.
         Chamado pelo motor TS via HTTP.
 
         Retorna o resultado da ordem para registro no Supabase.
+        
+        Args:
+            force_execute: Se True, executa mesmo que o tempo de entrada tenha passado
         """
         if not self._broker or not self._running:
             raise RuntimeError("Bridge não está rodando.")
 
         # Valida se o ativo está disponível antes de executar
         if not self._broker.is_asset_available(symbol):
-            raise RuntimeError(
-                f"Ativo {symbol} não está disponível/aberto para negociação. "
-                f"Ativos disponíveis: {await self.get_available_assets()}"
+            # Salva como pendente para executar quando o ativo estiver disponível
+            key = f"{symbol}:{timeframe}"
+            self._pending_signals[key] = {
+                "direction": direction,
+                "amount": amount,
+                "timeframe": timeframe,
+                "entry_price": entry_price,
+                "payout": payout,
+                "session_id": session_id,
+                "timestamp": __import__('time').time(),
+            }
+            logger.warning(
+                f"Ativo {symbol} não disponível. Sinal salvo como pendente para próximo candle."
             )
+            return {"status": "pending", "message": "Sinal salvo para próximo candle"}
 
+        # Verifica idade do candle para decidir se executa ou salva como pendente
+        key = f"{symbol}:{timeframe}"
+        candle_info = self._latest_candles.get(key, {})
+        candle_age = candle_info.get("age", 0)
+        
+        # Calcula tolerância baseada no timeframe (80% do ciclo do candle)
+        timeframe_s = TIMEFRAME_SECONDS.get(timeframe, 60)
+        max_candle_age = timeframe_s * 0.8
+        
+        # Se o candle é muito antigo e não está forçado, salva como pendente
+        if candle_age > max_candle_age and not force_execute:
+            logger.warning(
+                f"⏰ Candle de {symbol} tem {candle_age:.1f}s (max: {max_candle_age:.0f}s). "
+                f"Salvando como pendente para próximo candle."
+            )
+            self._pending_signals[key] = {
+                "direction": direction,
+                "amount": amount,
+                "timeframe": timeframe,
+                "entry_price": entry_price,
+                "payout": payout,
+                "session_id": session_id,
+                "timestamp": __import__('time').time(),
+            }
+            return {"status": "pending", "message": "Sinal salvo para próximo candle"}
+
+        # Executa a ordem
+        logger.info(f"Executando ordem: {direction} {symbol} R${amount} @ {entry_price}")
+        
         if direction.upper() == "CALL":
             result = self._broker.buy_call(
                 symbol=symbol,

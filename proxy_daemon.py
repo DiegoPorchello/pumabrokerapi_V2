@@ -72,6 +72,7 @@ class ActiveTrade:
     updated_at: str = ""  # Last update timestamp
     result: str = ""  # "WON"/"LOST"/"DRAW" raw from tradeResult payload
     new_balance: float = 0.0  # Balance after trade from tradeResult payload
+    trade_status: str = ""  # DB column for trade state tracking
 
     def __post_init__(self):
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -651,12 +652,14 @@ class RecoveryManager:
         """State machine for expired trades:
         1. ACTIVE -> WAITING_RESULT (when expires_at is reached + small grace)
         2. WAITING_RESULT -> ORPHAN (when 5 minutes pass without result)
+        3. ORPHAN -> REMOVED (when 1 hour passes — cleanup)
         """
         all_trades = self.trade_manager.get_all()
         now_utc = datetime.now(timezone.utc)
+        removed_count = 0
         
         for trade in all_trades:
-            if trade.status in ("WIN", "LOSS", "DRAW", "ORPHAN", "CANCELLED", "MISSING_RESULT", "DELAYED_RESULT"):
+            if trade.status in ("WIN", "LOSS", "DRAW", "CANCELLED", "MISSING_RESULT", "DELAYED_RESULT"):
                 continue
                 
             if not trade.expires_at:
@@ -682,6 +685,19 @@ class RecoveryManager:
                     trade.closed_at = now_utc.isoformat().replace("+00:00", "Z")
                     trade.updated_at = trade.closed_at
                     self.trade_manager.persistence.save(trade)
+
+            elif trade.status == "ORPHAN":
+                # Limpa trades ORPHAN antigos (> 1 hora) para não acumular no SQLite
+                if seconds_since_expiry > 3600:
+                    logger.info(
+                        "RecoveryManager: Removendo trade ORPHAN antigo %s "
+                        "(%.0fs desde expiração)", trade.id, seconds_since_expiry
+                    )
+                    self.trade_manager.remove(trade.id)
+                    removed_count += 1
+
+        if removed_count > 0:
+            logger.info("RecoveryManager: %d trades ORPHAN removidos", removed_count)
 
     def _check_socket_health(self):
         if self.socket_manager:
@@ -918,30 +934,31 @@ class PumaDaemon:
                     logger.info("Recovery: tradeUpdate processado via TradeManager: id=%s status=%s profit=%.2f", trade.id, trade.status, trade.profit)
 
                 # Atualiza entrada existente no histórico
-                for entry in self._daemon._trade_history:
-                    if entry.get("id") == trade_id:
-                        entry["status"] = status
-                        entry["result"] = result
-                        entry["profit"] = profit
-                        entry["exitPrice"] = data.get("exitPrice")
-                        logger.info("WS tradeUpdate: id=%s status=%s profit=%.2f", trade_id, status, profit)
-                        return
+                with self._daemon._trade_history_lock:
+                    for entry in self._daemon._trade_history:
+                        if entry.get("id") == trade_id:
+                            entry["status"] = status
+                            entry["result"] = result
+                            entry["profit"] = profit
+                            entry["exitPrice"] = data.get("exitPrice")
+                            logger.info("WS tradeUpdate: id=%s status=%s profit=%.2f", trade_id, status, profit)
+                            return
 
-                # Trade novo (ex: copy trade) — adiciona ao histórico
-                self._daemon._trade_history.insert(0, {
-                    "id": trade_id,
-                    "asset": data.get("symbol"),
-                    "direction": data.get("direction"),
-                    "amount": data.get("amount"),
-                    "entryPrice": data.get("entryPrice"),
-                    "payout": data.get("payout"),
-                    "status": status,
-                    "profit": profit,
-                    "result": result,
-                    "openedAt": data.get("createdAt", time.time()),
-                })
-                if len(self._daemon._trade_history) > 200:
-                    self._daemon._trade_history = self._daemon._trade_history[:200]
+                    # Trade novo (ex: copy trade) — adiciona ao histórico
+                    self._daemon._trade_history.insert(0, {
+                        "id": trade_id,
+                        "asset": data.get("symbol"),
+                        "direction": data.get("direction"),
+                        "amount": data.get("amount"),
+                        "entryPrice": data.get("entryPrice"),
+                        "payout": data.get("payout"),
+                        "status": status,
+                        "profit": profit,
+                        "result": result,
+                        "openedAt": data.get("createdAt", time.time()),
+                    })
+                    if len(self._daemon._trade_history) > 200:
+                        self._daemon._trade_history = self._daemon._trade_history[:200]
 
             except Exception as e:
                 logger.error("Erro processando tradeUpdate: %s", e)
@@ -978,34 +995,35 @@ class PumaDaemon:
                     logger.info("Recovery: tradeResult processado via TradeManager: id=%s status=%s profit=%.2f", trade.id, trade.status, trade.profit)
                 
                 # Mantém _trade_history para compatibilidade com GET /trades
-                for entry in self._daemon._trade_history:
-                    if entry.get("id") == trade_id:
-                        entry["status"] = final_status
-                        entry["result"] = final_status.lower()
-                        entry["profit"] = profit
-                        entry["newBalance"] = new_balance
-                        entry["exitPrice"] = trade_data.get("exitPrice", entry.get("exitPrice"))
-                        entry["closedAt"] = trade_data.get("closedAt", entry.get("closedAt"))
-                        logger.info("WS tradeResult (legacy): id=%s status=%s profit=%.2f", trade_id, final_status, profit)
-                        return
+                with self._daemon._trade_history_lock:
+                    for entry in self._daemon._trade_history:
+                        if entry.get("id") == trade_id:
+                            entry["status"] = final_status
+                            entry["result"] = final_status.lower()
+                            entry["profit"] = profit
+                            entry["newBalance"] = new_balance
+                            entry["exitPrice"] = trade_data.get("exitPrice", entry.get("exitPrice"))
+                            entry["closedAt"] = trade_data.get("closedAt", entry.get("closedAt"))
+                            logger.info("WS tradeResult (legacy): id=%s status=%s profit=%.2f", trade_id, final_status, profit)
+                            return
 
-                # Trade novo (ex: copy trade) — adiciona ao histórico
-                self._daemon._trade_history.insert(0, {
-                    "id": trade_id,
-                    "asset": trade_data.get("symbol", trade_data.get("currency", "")),
-                    "direction": trade_data.get("direction", ""),
-                    "amount": trade_data.get("amount", 0),
-                    "entryPrice": trade_data.get("entryPrice", 0),
-                    "payout": trade_data.get("payout", 0),
-                    "status": final_status,
-                    "profit": profit,
-                    "result": result.lower(),
-                    "newBalance": new_balance,
-                    "openedAt": trade_data.get("openedAt", time.time()),
-                    "closedAt": trade_data.get("closedAt", time.time()),
-                })
-                if len(self._daemon._trade_history) > 200:
-                    self._daemon._trade_history = self._daemon._trade_history[:200]
+                    # Trade novo (ex: copy trade) — adiciona ao histórico
+                    self._daemon._trade_history.insert(0, {
+                        "id": trade_id,
+                        "asset": trade_data.get("symbol", trade_data.get("currency", "")),
+                        "direction": trade_data.get("direction", ""),
+                        "amount": trade_data.get("amount", 0),
+                        "entryPrice": trade_data.get("entryPrice", 0),
+                        "payout": trade_data.get("payout", 0),
+                        "status": final_status,
+                        "profit": profit,
+                        "result": result.lower(),
+                        "newBalance": new_balance,
+                        "openedAt": trade_data.get("openedAt", time.time()),
+                        "closedAt": trade_data.get("closedAt", time.time()),
+                    })
+                    if len(self._daemon._trade_history) > 200:
+                        self._daemon._trade_history = self._daemon._trade_history[:200]
 
             except Exception as e:
                 logger.error("Erro processando tradeResult: %s", e)
@@ -1043,6 +1061,7 @@ class PumaDaemon:
         self._copy_sessions: list[dict] = []
         self._recent_orders: deque[dict] = deque(maxlen=50)
         self._trade_history: list[dict] = []
+        self._trade_history_lock = threading.Lock()
         self._trade_ws = self._TradeWSListener(self)
         self._load_sessions()
         self._token_manager = None
@@ -1400,24 +1419,64 @@ class PumaDaemon:
             duration_received, signal_candle_time, candle_id, time.time()
         )
 
-        # ── DETECÇÃO DE DUPLICATAS ──
+        # ── IDEMPOTÊNCIA: BLOQUEIA reenvio da MESMA ordem ──
+        # Vetores de duplicata cobertos:
+        #   1. Retry do cliente (mesmo traceId em <120s) — ex.: resposta perdida.
+        #   2. Re-disparo do engine na mesma vela (<30s): mesmo ativo + direção +
+        #      valor + entryPrice.
+        # A duplicata NÃO é recolocada: aguarda brevemente o resultado da 1ª
+        # tentativa e o retorna; sem resultado, devolve DUPLICATE_BLOCKED.
         now = time.time()
         dupe_key = (body["asset"], body["direction"], body["amount"])
-        for prev in self._recent_orders:
-            if (prev["key"] == dupe_key and
-                now - prev["time"] < 30 and
-                prev.get("entryPrice") == body.get("entryPrice")):
-                logger.warning(
-                    "═══ DUPLICATA DETECTADA ═══ asset=%s dir=%s amount=%s intervalo=%.1fs "
-                    "(mesmo ativo + direção + valor + entryPrice em <30s)",
-                    body["asset"], body["direction"], body["amount"], now - prev["time"]
+
+        def _find_prev():
+            for prev in self._recent_orders:
+                same_trace = bool(trace_id) and prev.get("traceId") == trace_id and now - prev["time"] < 120
+                same_sig = (
+                    prev.get("key") == dupe_key
+                    and now - prev["time"] < 30
+                    and prev.get("entryPrice") == body.get("entryPrice")
                 )
-                break
-        self._recent_orders.append({
+                if same_trace or same_sig:
+                    return prev
+            return None
+
+        prev_dup = _find_prev()
+        if prev_dup is not None:
+            # Aguarda a 1ª tentativa "em voo" resolver (race entre requests)
+            waited = 0.0
+            while prev_dup.get("result") is None and waited < 8.0:
+                time.sleep(0.1)
+                waited += 0.1
+            first_result = prev_dup.get("result")
+            if first_result:
+                logger.warning(
+                    "═══ DUPLICATA BLOQUEADA ═══ asset=%s dir=%s amount=%s traceId=%s intervalo=%.1fs "
+                    "— retornando ordem original %s (NÃO recolocada)",
+                    body["asset"], body["direction"], body["amount"], trace_id,
+                    now - prev_dup["time"], first_result.get("id", "")
+                )
+                return first_result
+            logger.warning(
+                "═══ DUPLICATA BLOQUEADA (1ª tentativa sem resultado) ═══ asset=%s traceId=%s "
+                "— ordem NÃO reenviada",
+                body["asset"], trace_id
+            )
+            return {
+                "id": "",
+                "status": "DUPLICATE_BLOCKED",
+                "expiresAt": None,
+                "duplicateOfTraceId": prev_dup.get("traceId", ""),
+            }
+
+        reserved = {
             "key": dupe_key,
+            "traceId": trace_id,
             "entryPrice": body.get("entryPrice"),
             "time": now,
-        })
+            "result": None,
+        }
+        self._recent_orders.append(reserved)
 
         _t0 = time.perf_counter()
         _t_start_send = None
@@ -1469,19 +1528,23 @@ class PumaDaemon:
             logger.info(f"[LATENCY] place_trade RETRY: puma_api={round((_t2 - _t_retry) * 1000)}ms total={round((_t2 - _t0) * 1000)}ms")
 
         # ── ARMAZENA NO HISTÓRICO (para GET /trades list) ──
-        self._trade_history.append({
-            "id": result.get("id"),
-            "asset": body.get("asset"),
-            "direction": body.get("direction"),
-            "amount": body.get("amount"),
-            "entryPrice": body.get("entryPrice", 0),
-            "payout": payout,
-            "status": result.get("status", "ACTIVE"),
-            "profit": result.get("profit", 0),
-            "result": result.get("result", "pending"),
-            "openedAt": result.get("openedAt", result.get("createdAt", time.time())),
-        })
-        self._trade_history = self._trade_history[-200:]  # mantém só os 200 mais recentes
+        with self._trade_history_lock:
+            self._trade_history.append({
+                "id": result.get("id"),
+                "asset": body.get("asset"),
+                "direction": body.get("direction"),
+                "amount": body.get("amount"),
+                "entryPrice": body.get("entryPrice", 0),
+                "payout": payout,
+                "status": result.get("status", "ACTIVE"),
+                "profit": result.get("profit", 0),
+                "result": result.get("result", "pending"),
+                "openedAt": result.get("openedAt", result.get("createdAt", time.time())),
+            })
+            self._trade_history = self._trade_history[-200:]  # mantém só os 200 mais recentes
+
+        # Libera requests duplicados aguardando em _find_prev() (idempotência)
+        reserved["result"] = result
 
         # ── RECOVERY: Persiste trade ativa no TradeManager ──
         trade = self.trade_manager.create_from_order(result)
@@ -1567,9 +1630,10 @@ class PumaDaemon:
             "result": "PENDING",
             "openedAt": int(time.time() * 1000),
         }
-        self._trade_history.insert(0, trade_entry)
-        if len(self._trade_history) > 200:
-            self._trade_history = self._trade_history[:200]
+        with self._trade_history_lock:
+            self._trade_history.insert(0, trade_entry)
+            if len(self._trade_history) > 200:
+                self._trade_history = self._trade_history[:200]
 
         return result
 
@@ -1638,13 +1702,19 @@ class PumaDaemon:
         tm_dict = {t.id: self._trade_to_dict(t) for t in tm_trades}
         
         # Merge com _trade_history (lista em memória populada por place_trade)
-        for entry in self._trade_history:
-            tid = entry.get("id", "")
-            if tid and tid not in tm_dict:
-                tm_dict[tid] = entry
+        with self._trade_history_lock:
+            for entry in self._trade_history:
+                tid = entry.get("id", "")
+                if tid and tid not in tm_dict:
+                    tm_dict[tid] = entry
         
         # Ordena por openedAt (mais recente primeiro) e limita
-        result = sorted(tm_dict.values(), key=lambda x: x.get("openedAt", 0), reverse=True)[:limit]
+        def _sort_key(x):
+            v = x.get("openedAt", 0)
+            if isinstance(v, str):
+                return v
+            return str(v) if v else ""
+        result = sorted(tm_dict.values(), key=_sort_key, reverse=True)[:limit]
         return result
 
     def _trade_to_dict(self, trade: ActiveTrade) -> dict:
@@ -1680,10 +1750,11 @@ class PumaDaemon:
             return self._trade_to_dict(trade)
         
         # Fallback: buscar em _trade_history (lista em memória populada por place_trade)
-        for entry in self._trade_history:
-            if entry.get("id") == order_id:
-                logger.info("ENDPOINT: /trades/%s found in _trade_history status=%s (fallback)", order_id, entry.get("status", "ACTIVE"))
-                return entry
+        with self._trade_history_lock:
+            for entry in self._trade_history:
+                if entry.get("id") == order_id:
+                    logger.info("ENDPOINT: /trades/%s found in _trade_history status=%s (fallback)", order_id, entry.get("status", "ACTIVE"))
+                    return entry
         
         logger.warning("ENDPOINT: /trades/%s NOT FOUND in TradeManager or _trade_history", order_id)
         return None
@@ -2007,7 +2078,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = self._get_path()
         try:
             if path == "/trades":
-                daemon._trade_history.clear()
+                with daemon._trade_history_lock:
+                    daemon._trade_history.clear()
                 logger.info("Trade history cleared via DELETE /trades")
                 self._send(200, {"success": True, "cleared": True})
             elif path.startswith("/copy/accounts/"):
@@ -2144,6 +2216,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send(status, {"error": str(e)})
         except Exception as e:
             logger.error("Erro em POST %s: %s", path, e)
+            import traceback
+            traceback.print_exc()
             self._send(500, {"error": str(e)})
 
     def do_GET(self):
@@ -2168,7 +2242,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if result is None:
                     logger.warning(
                         "ENDPOINT_ERROR: /trades/%s retornou 404 - tradeId=%s endpoint=%s time_opened=",
-                        order_id, order_id, f"/trades/{order_id}", daemon._active_trades.get(order_id).opened_at if daemon._active_trades.get(order_id) else "unknown"
+                        order_id, order_id, f"/trades/{order_id}", daemon.trade_manager._active_trades.get(order_id).opened_at if daemon.trade_manager._active_trades.get(order_id) else "unknown"
                     );
                     self._send(404, {"error": "Trade não encontrada"})
                 else:
@@ -2275,6 +2349,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send(status, {"error": str(e)})
         except Exception as e:
             logger.error("Erro em GET %s: %s", path, e)
+            import traceback
+            traceback.print_exc()
             self._send(500, {"error": str(e)})
 
     def log_message(self, format, *args):

@@ -48,13 +48,19 @@ class MarketWebSocket:
             await ws.listen()
     """
 
+    DEAD_CONNECTION_TIMEOUT = 30  # segundos sem resposta → reconectar
+
     def __init__(self, session_token: str):
         self._token    = session_token
         self._ws       = None
         self._running  = False
         self._handlers: Dict[str, List[BarHandler]] = {}
         self._last_server_time: Optional[int] = None
+        self._last_message_time: float = 0.0
         self._reconnect_count = 0
+        # Subscriptions dinâmicas extraídas dos handlers registrados
+        self._subscribed_symbols: List[str] = []
+        self._subscribed_intervals: List[str] = []
 
     # ── Registro de handlers ──────────────────────────────────────────────────
 
@@ -72,7 +78,16 @@ class MarketWebSocket:
         """
         key = f"{symbol}:{interval}"
         self._handlers.setdefault(key, []).append(handler)
-        logger.debug("Handler registrado: %s interval=%s", symbol, interval)
+
+        # Rastreia subscriptions para envio dinâmico ao servidor
+        sym_upper = symbol.upper()
+        if sym_upper not in self._subscribed_symbols:
+            self._subscribed_symbols.append(sym_upper)
+        if interval not in self._subscribed_intervals:
+            self._subscribed_intervals.append(interval)
+
+        logger.debug("Handler registrado: %s interval=%s (total symbols=%d)",
+                      symbol, interval, len(self._subscribed_symbols))
 
     def on_any_bar(self, handler: BarHandler) -> None:
         """Registra callback para todos os bar_updates independente de símbolo."""
@@ -111,16 +126,22 @@ class MarketWebSocket:
         Envia pedido de inscrição após autenticação.
         Frame real observado no DevTools:
         {"method":"subscribe","params":{"symbols":["EURUSD"], "intervals":["5"]}}
+
+        Agora usa symbols/intervals dinâmicos baseados nos handlers registrados.
         """
+        symbols = self._subscribed_symbols if self._subscribed_symbols else ["EURUSD"]
+        intervals = self._subscribed_intervals if self._subscribed_intervals else ["1"]
+
         payload = {
             "method": "subscribe",
             "params": {
-                "symbols": ["EURUSD"],
-                "intervals": ["5"]
+                "symbols": symbols,
+                "intervals": intervals
             }
         }
         await self._ws.send(json.dumps(payload))
-        logger.info("→ WS2 subscribe enviado: EURUSD 5min")
+        logger.info("→ WS2 subscribe enviado: symbols=%s intervals=%s",
+                     symbols, intervals)
 
     # ── Heartbeat manual ──────────────────────────────────────────────────────
 
@@ -146,6 +167,10 @@ class MarketWebSocket:
         except json.JSONDecodeError:
             logger.debug("WS2 frame não-JSON ignorado: %s", raw[:80])
             return
+
+        # Atualiza timestamp da última mensagem recebida
+        import time as _time
+        self._last_message_time = _time.time()
 
         msg_type = data.get("type") or data.get("method")
         logger.debug("← WS2 [%s]: %s", msg_type, raw[:120])
@@ -182,13 +207,17 @@ class MarketWebSocket:
     # ── Loop principal ────────────────────────────────────────────────────────
 
     async def listen(self) -> None:
-        """Loop de escuta com reconexão automática."""
+        """Loop de escuta com reconexão automática + detecção de dead connection."""
         self._running = True
+        import time as _time
+        self._last_message_time = _time.time()
 
         while self._running:
             try:
                 # Inicia heartbeat em paralelo
                 hb_task = asyncio.create_task(self._heartbeat_loop())
+                # Inicia watchdog de dead connection
+                watchdog_task = asyncio.create_task(self._dead_connection_watchdog())
 
                 async for raw in self._ws:
                     if isinstance(raw, bytes):
@@ -201,6 +230,7 @@ class MarketWebSocket:
                 logger.error("WS2 erro: %s", exc, exc_info=True)
             finally:
                 hb_task.cancel()
+                watchdog_task.cancel()
 
             if not self._running:
                 break
@@ -213,8 +243,29 @@ class MarketWebSocket:
             try:
                 await self.connect()
                 self._reconnect_count = 0
+                self._last_message_time = _time.time()
             except Exception as exc:
                 logger.error("WS2 falha na reconexão: %s", exc)
+
+    async def _dead_connection_watchdog(self) -> None:
+        """Detecta conexão morta: sem nenhuma mensagem por DEAD_CONNECTION_TIMEOUT segundos."""
+        while self._running:
+            await asyncio.sleep(10)
+            if not self._ws or not self._running:
+                continue
+            import time as _time
+            elapsed = _time.time() - self._last_message_time
+            if elapsed > self.DEAD_CONNECTION_TIMEOUT:
+                logger.warning(
+                    "WS2 DEAD CONNECTION: %.0fs sem mensagens — forçando reconexão",
+                    elapsed,
+                )
+                try:
+                    if self._ws:
+                        await self._ws.close()
+                except Exception:
+                    pass
+                break
 
     async def disconnect(self) -> None:
         self._running = False

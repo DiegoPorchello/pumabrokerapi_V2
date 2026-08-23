@@ -60,7 +60,8 @@ async def _proxy_handler(client_ws: WebSocketServerProtocol):
             PUMA_WS2_URL,
             additional_headers=headers,
             compression="deflate",
-            ping_interval=None,
+            ping_interval=30,
+            ping_timeout=10,
             close_timeout=5,
         ) as puma_ws:
             logger.info("Conectado ao Puma WS2 (client=%s)", client_id)

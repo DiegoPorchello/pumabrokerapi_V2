@@ -200,22 +200,48 @@ class PumaBroker:
     def is_asset_available(self, symbol: str) -> bool:
         """
         Verifica se o ativo está disponível/aberto para negociação.
-        Consulta a API de ativos ativos e checa se o símbolo está na lista.
+        Usa cache de 60s para evitar chamadas REST repetidas.
         """
+        import time as _time
+
+        # Cache de disponibilidade (TTL: 60s)
+        if not hasattr(self, '_asset_cache'):
+            self._asset_cache = {}
+        if not hasattr(self, '_asset_cache_time'):
+            self._asset_cache_time = {}
+
+        now = _time.time()
+        cache_key = symbol.upper()
+        cached_time = self._asset_cache_time.get(cache_key, 0)
+
+        # Retorna do cache se válido (60s)
+        if now - cached_time < 60 and cache_key in self._asset_cache:
+            return self._asset_cache[cache_key]
+
         try:
             assets = self.get_active_assets()
             # A API retorna lista ou dict; normaliza para busca case-insensitive
             if isinstance(assets, dict):
-                # procura em chaves e valores
                 symbol_upper = symbol.upper()
-                return any(symbol_upper in str(k).upper() or symbol_upper in str(v).upper()
-                           for k, v in assets.items())
+                available = any(
+                    symbol_upper in str(k).upper() or symbol_upper in str(v).upper()
+                    for k, v in assets.items()
+                )
             elif isinstance(assets, list):
-                return any(symbol.upper() in str(item).upper() for item in assets)
-            return False
+                available = any(symbol.upper() in str(item).upper() for item in assets)
+            else:
+                available = False
+
+            # Atualiza cache
+            self._asset_cache[cache_key] = available
+            self._asset_cache_time[cache_key] = now
+            return available
+
         except Exception as e:
-            logger.error(f"Erro CRÍTICO ao verificar disponibilidade de {symbol}: {e}")
-            raise RuntimeError(f"Não foi possível verificar disponibilidade do ativo {symbol}: {e}") from e
+            logger.error(f"Erro ao verificar disponibilidade de {symbol}: {e}")
+            # Em caso de erro, retorna True para não bloquear a ordem
+            # (a própria API rejeitará se o ativo não estiver disponível)
+            return True
 
     # ── Candles em tempo real ─────────────────────────────────────────────────
 

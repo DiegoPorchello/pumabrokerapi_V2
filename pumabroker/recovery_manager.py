@@ -727,7 +727,11 @@ class RecoveryManager:
                 self._apply_api_backoff()
 
     def _reconcile_trade(self, local: ActiveTrade, server: dict):
-        """Reconcile a single local trade with server data"""
+        """
+        Reconcile a single local trade with server data.
+        Uses trade_manager.update_from_poll() to ensure both persistence
+        AND in-memory cache (_active_trades) are updated consistently.
+        """
         server_status = str(server.get("status", "")).upper()
         server_result = str(server.get("result", "")).upper()
         server_profit = float(server.get("profit", 0))
@@ -742,19 +746,17 @@ class RecoveryManager:
         else:
             server_final_status = server_status
 
-        # If status changed, update local
+        # If status changed, update via TradeManager (updates both cache + persistence)
         if local.status != server_final_status:
-            logger.info("RecoveryManager: Reconciling trade %s: local=%s server=%s", 
+            logger.info("RecoveryManager: Reconciling trade %s: local=%s server=%s",
                        local.id, local.status, server_final_status)
-            local.status = server_final_status
-            local.profit = server_profit
-            local.exit_price = float(server.get("exitPrice", server.get("exit_price", local.exit_price)))
-            local.closed_at = server.get("closedAt", server.get("closed_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")))
-            local.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            self.trade_manager.persistence.save(local)
-            self.trade_manager._notify(local)
-            logger.info("RecoveryManager: Trade %s reconciled to %s profit=%.2f", 
-                       local.id, local.status, local.profit)
+            # Use update_from_poll which updates BOTH _active_trades AND persistence
+            updated = self.trade_manager.update_from_poll(server)
+            if updated:
+                logger.info("RecoveryManager: Trade %s reconciled to %s profit=%.2f",
+                           updated.id, updated.status, updated.profit)
+            else:
+                logger.warning("RecoveryManager: update_from_poll returned None for trade %s", local.id)
 
     def _check_expired_trades(self):
         """Check for trades that expired but never got result.

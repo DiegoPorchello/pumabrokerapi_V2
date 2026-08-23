@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 TOKEN_FILE = "puma_tokens.json"
 JWT_ALGO = "HS256"
 TOKEN_REFRESH_BUFFER = 300
+
+# ── Login Mutex ──
+_login_mutex = threading.Lock()
+_login_in_progress = False
 
 
 @dataclass
@@ -209,6 +214,9 @@ class TokenManager:
                 json={"refreshToken": self._tokens.refresh_token},
                 timeout=config.HTTP_TIMEOUT,
             )
+            if resp.status_code == 429:
+                logger.warning("[AUTH] TokenManager: HTTP 429 no refresh — ignorando (backoff ativo)")
+                return False
             if resp.status_code == 200:
                 data = resp.json()
                 self._update_tokens_from_refresh(data)
@@ -248,7 +256,11 @@ class TokenManager:
           1. Se accessToken válido -> retorna
           2. Se expirado e tem refreshToken -> tenta refresh
           3. Se refresh falhar ou não tiver refreshToken -> login completo
+
+        Usa mutex para garantir que apenas uma thread faz login por vez.
         """
+        global _login_in_progress
+
         if self._tokens.is_valid():
             remaining = self._tokens.expires_at - time.time()
             logger.debug(
@@ -258,14 +270,32 @@ class TokenManager:
             )
             return self._tokens.access_token
 
-        logger.info("TokenManager: Access token expirado ou ausente, tentando renovar...")
+        # ── Mutex: espera se outro login está em andamento ──
+        if _login_in_progress:
+            logger.info("[AUTH] TOKEN REUSED — outro login em andamento, aguardando mutex...")
+            with _login_mutex:
+                # Após esperar, verifica se token foi atualizado
+                if self._tokens.is_valid():
+                    logger.info("[AUTH] TOKEN REUSED — token atualizado por outra thread")
+                    return self._tokens.access_token
 
-        if self._tokens.refresh_token and self._do_refresh():
-            return self._tokens.access_token
+        with _login_mutex:
+            _login_in_progress = True
+            try:
+                # Double-check após adquirir mutex
+                if self._tokens.is_valid():
+                    return self._tokens.access_token
 
-        logger.info("TokenManager: Refresh falhou ou indisponível, fazendo login completo...")
-        session = self._do_full_login()
-        return session.token
+                logger.info("TokenManager: Access token expirado ou ausente, tentando renovar...")
+
+                if self._tokens.refresh_token and self._do_refresh():
+                    return self._tokens.access_token
+
+                logger.info("TokenManager: Refresh falhou ou indisponível, fazendo login completo...")
+                session = self._do_full_login()
+                return session.token
+            finally:
+                _login_in_progress = False
 
     def get_refresh_token(self) -> str:
         """Retorna refreshToken atual."""
@@ -300,7 +330,7 @@ class TokenManager:
 
     def force_refresh(self) -> str:
         """Força renovação do token (útil após erro 401)."""
-        logger.info("TokenManager: Refresh forçado solicitado")
+        logger.info("[AUTH] FORCE_REFRESH solicitado")
         self._tokens.expires_at = 0
         return self.get_access_token()
 
