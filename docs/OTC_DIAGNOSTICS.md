@@ -1,3 +1,5 @@
+> **Aviso (21/10/2026): investigação `/otc` arquivada como diagnóstico não conclusivo. BETHUSDT M1 foi recebido e salvo via `wss://market.pumabroker.com/ws`. Consulte o [guia atualizado](HYBRID_MARKET_BETHUSDT.md).**
+
 # Correção WS2 e diagnóstico do mercado híbrido
 
 A documentação técnica v4.3 (15/07/2026) registra que o WS2 não
