@@ -87,16 +87,16 @@ async def stream(collector: ClosedBarCollector, proxy_url: str):
     from urllib.parse import urlsplit
     from websockets.asyncio.client import connect
     parsed = urlsplit(proxy_url)
-    if parsed.scheme != "ws" or parsed.hostname not in ("127.0.0.1", "localhost") or parsed.username or parsed.password:
-        raise ValueError("Somente proxy WS2 local ws://127.0.0.1 é permitido")
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-        raise ValueError("Não inclua credenciais/paths na URL local")
+    allowed_local = parsed.scheme == "ws" and parsed.hostname in ("127.0.0.1", "localhost") and parsed.path in ("", "/")
+    allowed_market = parsed.scheme == "wss" and parsed.hostname == "market.pumabroker.com" and parsed.path == "/ws"
+    if not (allowed_local or allowed_market) or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("URL permitida: ws://127.0.0.1:3002 ou wss://market.pumabroker.com/ws sem parâmetros")
     reconnect = 1
     while True:
         try:
             async with connect(proxy_url, open_timeout=10, ping_interval=20) as ws:
                 reconnect = 1
-                LOG.info("Proxy WS2 conectado; aguardando push passivo de %s M%s (sem subscribe)", collector.symbol, collector.interval)
+                LOG.info("Feed conectado: %s. Aguardando push passivo %s M%s (sem subscribe)", parsed.hostname, collector.symbol, collector.interval)
                 async for msg in ws:
                     try:
                         data = json.loads(msg)
@@ -125,7 +125,7 @@ def main():
     parser = argparse.ArgumentParser(description="Puma WS2 read-only, sinais sem ordens")
     parser.add_argument("--symbol", default="BETHUSDT")
     parser.add_argument("--interval", default="1", choices=list(INTERVALS))
-    parser.add_argument("--proxy", default="ws://127.0.0.1:3002")
+    parser.add_argument("--proxy", default="ws://127.0.0.1:3002", help="Proxy local ou wss://market.pumabroker.com/ws")
     parser.add_argument("--output", default="candles_live.csv")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
