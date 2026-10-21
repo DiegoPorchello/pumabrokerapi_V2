@@ -1,3 +1,5 @@
+> **Aviso (21/10/2026): conteúdo histórico/legado. Para BETHUSDT M1 use `puma_hybrid_collector.py` e o [guia validado de Hybrids](HYBRID_MARKET_BETHUSDT.md). O comando antigo de coleta passiva sem SUBSCRIBE não representa o protocolo do `market.pumabroker.com/ws`.**
+
 ## Coleta WS2 e sinais em tempo real (somente leitura)
 
 O arquivo `puma_readonly_collector.py` consome exclusivamente o proxy local
