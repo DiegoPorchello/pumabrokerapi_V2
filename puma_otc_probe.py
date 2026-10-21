@@ -45,6 +45,9 @@ async def run_probe(seconds: int):
     @sio.event(namespace="/otc")
     async def disconnect():
         LOG.info("Namespace /otc desconectado")
+    @sio.event(namespace="/otc")
+    async def connect_error(data):
+        LOG.warning("Namespace /otc recusado; tipo de resposta=%s (conteúdo omitido)", type(data).__name__)
     @sio.on("*", namespace="/otc")
     async def on_event(event, *args):
         counts[str(event)] += 1
@@ -56,6 +59,10 @@ async def run_probe(seconds: int):
                           auth={"token":token} if token else None,
                           wait_timeout=10)
         await asyncio.sleep(seconds)
+    except socketio.exceptions.ConnectionError:
+        LOG.error("Conexão Socket.IO ao /otc recusada ou indisponível. Verifique a sessão e o handshake no navegador; não envie tokens ou cookies.")
+    except (OSError, TimeoutError) as exc:
+        LOG.error("Falha de rede ao conectar ao /otc: %s", type(exc).__name__)
     finally:
         if sio.connected:
             await sio.disconnect()
