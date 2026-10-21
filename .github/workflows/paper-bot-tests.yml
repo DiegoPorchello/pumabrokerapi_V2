@@ -5,7 +5,8 @@ on:
   pull_request:
     paths:
       - paper_probability_bot.py
-      - tests/test_paper_probability_bot.py
+      - puma_readonly_collector.py
+      - tests/**
       - .github/workflows/paper-bot-tests.yml
 jobs:
   tests:
@@ -15,5 +16,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Unit tests
-        run: python -m unittest discover -s tests -p 'test_paper_probability_bot.py' -v
+      - name: Unit tests (offline, no broker secrets)
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
