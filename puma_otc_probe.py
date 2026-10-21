@@ -34,8 +34,31 @@ def describe_event(name, payload, target="BETHUSDT"):
 async def run_probe(seconds: int):
     import socketio
     token = os.environ.get("PUMA_BEARER_TOKEN", "").strip()
+    cookies = {}
+    if not token and os.environ.get("PUMA_EMAIL", "").strip():
+        from getpass import getpass
+        import requests
+        email = os.environ["PUMA_EMAIL"].strip()
+        password = getpass("Senha Puma (oculta): ")
+        try:
+            response = requests.post(
+                URL + "/api/v1/auth/login",
+                json={"email": email, "password": password},
+                timeout=15,
+            )
+            response.raise_for_status()
+            body = response.json()
+            token = body.get("accessToken") or body.get("token") or ""
+            cookies = requests.utils.dict_from_cookiejar(response.cookies)
+            LOG.info("Login HTTP concluido; JWT=%s; cookie=%s", bool(token), bool(cookies))
+        except (requests.RequestException, ValueError) as exc:
+            LOG.error("Login HTTP falhou: %s", type(exc).__name__)
+            return
+        finally:
+            password = None
     if not token:
-        LOG.warning("Sem PUMA_BEARER_TOKEN; /otc pode recusar conexão. Não coloque token no Git ou no chat.")
+        LOG.warning("Sem JWT. Configure PUMA_EMAIL localmente ou PUMA_BEARER_TOKEN.")
+        return
     # O probe não escuta /trades, só namespace de dados /otc.
     sio = socketio.AsyncClient(reconnection=False, logger=False, engineio_logger=False)
     counts = Counter()
@@ -54,10 +77,12 @@ async def run_probe(seconds: int):
         info = describe_event(event, args)
         LOG.info("Evento OTC: %s", info)
     try:
+        headers = {"Authorization": "Bearer " + token}
+        if cookies:
+            headers["Cookie"] = "; ".join(k + "=" + v for k, v in cookies.items())
         await sio.connect(URL, namespaces=["/otc"], socketio_path="socket.io",
-                          transports=["websocket"],
-                          auth={"token":token} if token else None,
-                          wait_timeout=10)
+                          transports=["websocket"], headers=headers,
+                          auth={"token":token}, wait_timeout=10)
         await asyncio.sleep(seconds)
     except socketio.exceptions.ConnectionError:
         LOG.error("Conexão Socket.IO ao /otc recusada ou indisponível. Verifique a sessão e o handshake no navegador; não envie tokens ou cookies.")
