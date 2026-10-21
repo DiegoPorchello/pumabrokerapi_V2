@@ -96,18 +96,26 @@ async def stream(collector: ClosedBarCollector, proxy_url: str):
         try:
             async with connect(proxy_url, open_timeout=10, ping_interval=20) as ws:
                 reconnect = 1
-                await ws.send(json.dumps({"method": "subscribe", "params": {
-                    "symbols": [collector.symbol], "intervals": [collector.interval]
-                }}))
-                LOG.info("Conectado ao proxy WS2 local; recebendo %s M%s", collector.symbol, collector.interval)
+                LOG.info("Proxy WS2 conectado; aguardando push passivo de %s M%s (sem subscribe)", collector.symbol, collector.interval)
                 async for msg in ws:
                     try:
                         data = json.loads(msg)
                         if isinstance(data, dict):
+                            kind = data.get("type") or data.get("method") or "unknown"
+                            if kind == "auth":
+                                symbols = data.get("symbols")
+                                if isinstance(symbols, list):
+                                    LOG.info("WS2 AUTH ok, ativos anunciados=%d, ativo alvo presente=%s", len(symbols), collector.symbol in symbols)
+                                else:
+                                    LOG.info("WS2 AUTH recebido sem lista de ativos")
+                            elif kind == "error":
+                                LOG.warning("WS2 retornou erro: %s", str(data.get("message", ""))[:160])
+                            elif kind not in ("bar_update", "server_time"):
+                                LOG.info("WS2 evento nao reconhecido: %s (sem registrar payload sensivel)", kind)
                             collector.ingest(data)
                     except (json.JSONDecodeError, TypeError):
                         LOG.warning("Frame inválido descartado")
-        except (OSError, TimeoutError, Exception) as exc:
+        except Exception as exc:
             # Reconexão não autoriza reabrir ordens; nunca há ordens aqui.
             LOG.warning("WS2 indisponível (%s). Reconectando.", type(exc).__name__)
             await asyncio.sleep(reconnect)
