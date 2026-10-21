@@ -1,4 +1,4 @@
-# pumabroker — Biblioteca Python para Puma Broker
+> **Atualização de integração (21/10/2026):** o feed validado para BETHUSDT M1 é `wss://market.pumabroker.com/ws`, com AUTH → SUBSCRIBE_TICKS → SUBSCRIBE → `bar_closed`. O arquivo `puma_hybrid_collector.py` já gravou candles reais no Windows. Consulte **[guia do feed híbrido](docs/HYBRID_MARKET_BETHUSDT.md)** para comandos e limites. As seções legadas abaixo descrevem implementações antigas, podem estar desatualizadas e **não devem ser seguidas para coletar BETHUSDT**. Nunca publique credenciais.\n\n---\n\n# pumabroker — Biblioteca Python para Puma Broker
 
 Integração em tempo real com a plataforma **trade.pumabroker.com** via
 WebSocket e REST, baseada em engenharia reversa do protocolo real
