@@ -28,3 +28,20 @@ fechamento quando chega update do próximo candle. Lacunas reiniciam o
 histórico da estratégia; CSV de múltiplas sessões precisa de validação extra
 para backtest (ordem, intervalo constante e nenhuma lacuna). Os sinais
 **não são ordens** nem probabilidades calibradas.
+
+
+## NOVO: feed de mercado para BETHUSDT observado no Chrome (21/10/2026)
+
+Captura do navegador mostrou `wss://market.pumabroker.com/ws`, status HTTP 101,
+com eventos `tick` e `bar_update` de `BETHUSDT` no intervalo `1`.
+O coletor pode se conectar de forma passiva diretamente, sem `subscribe`:
+
+```powershell
+python puma_readonly_collector.py --proxy wss://market.pumabroker.com/ws --symbol BETHUSDT --interval 1 --output candles_beth.csv
+```
+
+**Pendente de validação:** não sabemos se a conexão direta requer cookies,
+token, mensagem inicial ou verificação; não copie o campo `verify`
+em logs ou repositórios. O comando não envia ordens nem faz login.
+Se falhar, capture apenas códigos de fechamento/tipos de mensagens
+e inspecione o handshake do navegador, removendo segredos.
