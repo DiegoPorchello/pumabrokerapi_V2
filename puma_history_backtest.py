@@ -1,7 +1,8 @@
 """Consulta read-only de histórico TradingView na Puma + backtest dos últimos N candles.
-Não recebe senha e não envia ordens. Token JWT somente por variável de ambiente local.
+Login interativo local opcional, token somente em memória. Nunca envia ordens.
 """
 import argparse
+from getpass import getpass
 import csv
 import json
 import os
@@ -13,6 +14,23 @@ import requests
 from paper_probability_bot import Candle, backtest
 
 ENDPOINT="https://trade.pumabroker.com/api/v1/tradingview/history"
+LOGIN_ENDPOINT="https://trade.pumabroker.com/api/v1/auth/login"
+
+def login_for_jwt(email, password, session=None):
+    """Solicita JWT REST via login. Não registra senha nem persiste tokens."""
+    if not email or not password:
+        raise ValueError("E-mail ou senha ausente")
+    client=session or requests.Session()
+    response=client.post(LOGIN_ENDPOINT,json={"email":email,"password":password},timeout=20)
+    response.raise_for_status()
+    data=response.json()
+    if not isinstance(data,dict):
+        raise ValueError("Resposta de login inválida")
+    token=data.get("accessToken") or data.get("token")
+    if not isinstance(token,str) or not token.strip():
+        raise ValueError("Login não retornou JWT")
+    return token.strip()
+
 
 def normalize_history(payload):
     if not isinstance(payload,dict) or payload.get("s")!="ok":
@@ -77,12 +95,24 @@ def main():
     p.add_argument("--expiry",type=int,default=1)
     p.add_argument("--csv",default="historico_1000_beth.csv")
     p.add_argument("--report",default="backtest_1000_beth.json")
+    p.add_argument("--login",action="store_true",help="Fazer login interativo; senha não aparece no terminal")
     a=p.parse_args()
     if a.count<25 or a.count>5000:
         p.error("--count deve estar entre 25 e 5000")
     token=os.getenv("PUMA_BEARER_TOKEN","").strip()
+    if not token and a.login:
+        email=os.getenv("PUMA_EMAIL","").strip() or input("E-mail Puma: ").strip()
+        password=getpass("Senha Puma (oculta): ")
+        try:
+            token=login_for_jwt(email,password)
+            print("Login REST concluído; JWT disponível apenas em memória.")
+        except (ValueError,requests.RequestException):
+            print("ERRO: login REST falhou; verifique credenciais e acesso.",file=sys.stderr)
+            sys.exit(2)
+        finally:
+            password=None
     if not token:
-        print("ERRO: configure PUMA_BEARER_TOKEN no ambiente local (não cole no chat/Git).",file=sys.stderr)
+        print("ERRO: configure PUMA_BEARER_TOKEN ou use --login (sem salvar credenciais).",file=sys.stderr)
         sys.exit(2)
     try:
         bars=fetch_history(a.symbol,a.resolution,a.count,token)
