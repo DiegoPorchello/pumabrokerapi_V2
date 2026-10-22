@@ -78,6 +78,21 @@ def fetch_history(symbol, resolution, count, token, session=None):
     bars=normalize_history(response.json())
     return contiguous_tail(bars,step,count)
 
+def fetch_history_with_reauth(symbol, resolution, count, token, login_callback=None, session=None):
+    """Reautentica uma unica vez em HTTP 401, sem salvar segredos.
+    Nao tenta login em HTTP 403, 429 ou erros de rede.
+    """
+    client=session or requests.Session()
+    try:
+        return fetch_history(symbol,resolution,count,token,session=client)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 401 or login_callback is None:
+            raise
+        new_token=login_callback()
+        if not new_token:
+            raise ValueError("Reautenticacao nao retornou JWT") from None
+        return fetch_history(symbol,resolution,count,new_token,session=client)
+
 def save_csv(bars,path):
     dest=Path(path)
     dest.parent.mkdir(parents=True,exist_ok=True)
@@ -100,6 +115,8 @@ def main():
     if a.count<25 or a.count>5000:
         p.error("--count deve estar entre 25 e 5000")
     token=os.getenv("PUMA_BEARER_TOKEN","").strip()
+    email=""
+    password=None
     if not token and a.login:
         email=os.getenv("PUMA_EMAIL","").strip() or input("E-mail Puma: ").strip()
         password=getpass("Senha Puma (oculta): ")
@@ -109,17 +126,18 @@ def main():
         except (ValueError,requests.RequestException):
             print("ERRO: login REST falhou; verifique credenciais e acesso.",file=sys.stderr)
             sys.exit(2)
-        finally:
-            password=None
     if not token:
         print("ERRO: configure PUMA_BEARER_TOKEN ou use --login (sem salvar credenciais).",file=sys.stderr)
         sys.exit(2)
     try:
-        bars=fetch_history(a.symbol,a.resolution,a.count,token)
+        relogin=(lambda: login_for_jwt(email,password)) if a.login and password else None
+        bars=fetch_history_with_reauth(a.symbol,a.resolution,a.count,token,login_callback=relogin)
     except (ValueError,requests.RequestException) as exc:
         print("ERRO ao consultar histórico: "+type(exc).__name__+
               ". Consulte status REST/autorização ou disponibilidade do ativo.",file=sys.stderr)
         sys.exit(1)
+    finally:
+        password=None
     if len(bars)<a.count:
         print(f"AVISO: obtidos somente {len(bars)} candles contínuos de {a.count} solicitados; não trataremos isso como 1000.")
     if len(bars)<25:
