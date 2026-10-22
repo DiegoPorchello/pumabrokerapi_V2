@@ -18,5 +18,22 @@ class TestHistory(unittest.TestCase):
     def test_1000_records(self):
         c=normalize_history(payload([i*60 for i in range(1100)]))
         self.assertEqual(len(contiguous_tail(c,60,1000)),1000)
+
+    def test_login_returns_jwt_without_persisting(self):
+        from puma_history_backtest import login_for_jwt
+        from unittest.mock import Mock
+        response=Mock()
+        response.json.return_value={"accessToken":"example-jwt"}
+        client=Mock()
+        client.post.return_value=response
+        self.assertEqual(login_for_jwt("user@example.com","secret",client),"example-jwt")
+        self.assertEqual(client.post.call_args.kwargs["json"]["email"],"user@example.com")
+    def test_login_rejects_missing_token(self):
+        from puma_history_backtest import login_for_jwt
+        from unittest.mock import Mock
+        client=Mock()
+        client.post.return_value.json.return_value={}
+        with self.assertRaises(ValueError):
+            login_for_jwt("user@example.com","secret",client)
 if __name__=="__main__":
     unittest.main()
