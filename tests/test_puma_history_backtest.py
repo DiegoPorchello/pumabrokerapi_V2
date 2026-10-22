@@ -35,5 +35,34 @@ class TestHistory(unittest.TestCase):
         client.post.return_value.json.return_value={}
         with self.assertRaises(ValueError):
             login_for_jwt("user@example.com","secret",client)
+
+    def test_reauth_once_on_401(self):
+        from puma_history_backtest import fetch_history_with_reauth
+        from unittest.mock import Mock
+        import requests
+        first=Mock()
+        response_401=requests.Response()
+        response_401.status_code=401
+        first.raise_for_status.side_effect=requests.HTTPError(response=response_401)
+        second=Mock()
+        second.json.return_value=payload([0,60,120])
+        client=Mock()
+        client.get.side_effect=[first,second]
+        result=fetch_history_with_reauth("BETHUSDT","1",3,"expired",login_callback=lambda:"fresh",session=client)
+        self.assertEqual(len(result),3)
+        self.assertEqual(client.get.call_count,2)
+        self.assertEqual(client.get.call_args.kwargs["headers"]["Authorization"],"Bearer fresh")
+    def test_no_reauth_on_403(self):
+        from puma_history_backtest import fetch_history_with_reauth
+        from unittest.mock import Mock
+        import requests
+        response=requests.Response()
+        response.status_code=403
+        session=Mock()
+        session.get.return_value.raise_for_status.side_effect=requests.HTTPError(response=response)
+        login=Mock(return_value="fresh")
+        with self.assertRaises(requests.HTTPError):
+            fetch_history_with_reauth("BETHUSDT","1",3,"expired",login_callback=login,session=session)
+        login.assert_not_called()
 if __name__=="__main__":
     unittest.main()
